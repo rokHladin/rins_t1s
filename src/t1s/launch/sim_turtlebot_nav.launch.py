@@ -23,7 +23,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 
 
-pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+pkg_t1s = get_package_share_directory('t1s')
 
 
 ARGUMENTS = [
@@ -37,7 +37,7 @@ ARGUMENTS = [
                           choices=['standard', 'lite'],
                           description='Turtlebot4 Model'),
     DeclareLaunchArgument('map', default_value=PathJoinSubstitution(
-                          [pkg_dis_tutorial3, 'maps', 'map.yaml']),
+                          [pkg_t1s, 'maps', 'map.yaml']),
                           description='Full path to map yaml file to load'),
 ]
 
@@ -48,7 +48,7 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 
 def generate_launch_description():
     # Directories
-    package_dir = get_package_share_directory('dis_tutorial3')
+    package_dir = get_package_share_directory('t1s')
 
     # Paths
     ignition_launch = PathJoinSubstitution(
@@ -56,9 +56,9 @@ def generate_launch_description():
     robot_spawn_launch = PathJoinSubstitution(
         [package_dir, 'launch', 'turtlebot4_spawn.launch.py'])
     localization_launch = PathJoinSubstitution(
-        [pkg_dis_tutorial3, 'launch', 'localization.launch.py'])
+        [pkg_t1s, 'launch', 'localization.launch.py'])
     nav2_launch = PathJoinSubstitution(
-        [pkg_dis_tutorial3, 'launch', 'nav2.launch.py'])
+        [pkg_t1s, 'launch', 'nav2.launch.py'])
 
     # Launch configurations
     namespace = LaunchConfiguration('namespace')

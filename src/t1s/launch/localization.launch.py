@@ -35,19 +35,19 @@ ARGUMENTS = [
 
 
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_t1s = get_package_share_directory('t1s')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
 
     localization_params_arg = DeclareLaunchArgument(
         'params',
         default_value=PathJoinSubstitution(
-            [pkg_dis_tutorial3, 'config', 'localization.yaml']),
+            [pkg_t1s, 'config', 'localization.yaml']),
         description='Localization parameters')
 
     map_arg = DeclareLaunchArgument(
         'map',
         default_value=PathJoinSubstitution(
-            [pkg_dis_tutorial3, 'maps', 'map.yaml']),
+            [pkg_t1s, 'maps', 'map.yaml']),
         description='Full path to map yaml file to load')
 
     namespace = LaunchConfiguration('namespace')

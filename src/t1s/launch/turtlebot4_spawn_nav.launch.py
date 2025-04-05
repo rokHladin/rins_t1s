@@ -60,8 +60,8 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 def generate_launch_description():
 
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory(
-        'dis_tutorial3')
+    pkg_t1s = get_package_share_directory(
+        't1s')
     pkg_turtlebot4_navigation = get_package_share_directory(
         'turtlebot4_navigation')
     pkg_turtlebot4_ignition_bringup = get_package_share_directory(
@@ -92,11 +92,11 @@ def generate_launch_description():
         [pkg_irobot_create_common_bringup, 'launch', 'dock_description.launch.py'])
     
     localization_launch = PathJoinSubstitution(
-        [pkg_dis_tutorial3, 'launch', 'localization.launch.py'])
+        [pkg_t1s, 'launch', 'localization.launch.py'])
     slam_launch = PathJoinSubstitution(
-        [pkg_dis_tutorial3, 'launch', 'slam.launch.py'])
+        [pkg_t1s, 'launch', 'slam.launch.py'])
     nav2_launch = PathJoinSubstitution(
-        [pkg_dis_tutorial3, 'launch', 'nav2.launch.py'])
+        [pkg_t1s, 'launch', 'nav2.launch.py'])
 
     # Parameters
     param_file_cmd = DeclareLaunchArgument(
@@ -245,7 +245,7 @@ def generate_launch_description():
         executable="scan_to_scan_filter_chain",
         parameters=[
             PathJoinSubstitution([
-                pkg_dis_tutorial3,
+                pkg_t1s,
                 "config",
                 "laser_filter_chain.yaml",
         ])],

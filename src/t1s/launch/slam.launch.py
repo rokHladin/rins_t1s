@@ -40,7 +40,7 @@ ARGUMENTS = [
 
 
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_t1s = get_package_share_directory('t1s')
 
     namespace = LaunchConfiguration('namespace')
     sync = LaunchConfiguration('sync')
@@ -48,7 +48,7 @@ def generate_launch_description():
     slam_params_arg = DeclareLaunchArgument(
         'params',
         default_value=PathJoinSubstitution(
-            [pkg_dis_tutorial3, 'config', 'slam.yaml']),
+            [pkg_t1s, 'config', 'slam.yaml']),
         description='Robot namespace')
 
     slam_params = RewrittenYaml(
