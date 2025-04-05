@@ -4,7 +4,7 @@
   <name>t1s</name>
   <version>0.0.1</version>
   <description>t1s</description>
-
+  <maintainer email="matjazpogacnik5@gmail.com">mp</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
