@@ -5,28 +5,35 @@ from nav_msgs.msg import OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Quaternion
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
 import numpy as np
 import cv2
 import math
 import transforms3d.euler
+import os
+from ament_index_python.packages import get_package_share_directory
 
 
 class Planner(Node):
     def __init__(self):
         super().__init__('inspection_marker_publisher')
-
-        qos = QoSProfile(depth=1,
-                         reliability=ReliabilityPolicy.RELIABLE,
-                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_markers = self.create_publisher(MarkerArray, '/inspection_markers', qos)
 
         self.sub_map = self.create_subscription(OccupancyGrid, '/map', self.map_callback, qos)
-        self.pub_markers = self.create_publisher(MarkerArray, '/inspection_markers', qos)
+
+        self.map_received = False
+        self.map_img = None
+        self.occ_grid = None
+
+        # Parameters from map.yaml
+        self.occupied_thresh = 0.90
+        self.free_thresh = 0.25
 
         self.cam_offset = 0.5
         self.target_offset = 0.1
         self.spacing = 0.3
         self.max_line_length_m = 2.0
-        self.map_received = False
 
     def map_callback(self, msg):
         if self.map_received:
@@ -38,12 +45,24 @@ class Planner(Node):
         width = msg.info.width
         height = msg.info.height
 
-        grid = np.array(msg.data, dtype=np.int8).reshape((height, width))
-        occ = np.ones_like(grid, dtype=np.float32)
-        occ[grid == 100] = 0.0
-        occ[grid == -1] = -1.0
+        # Load map.pgm from package
+        package_path = get_package_share_directory('t1s')
+        map_path = os.path.join(package_path, 'maps', 'map.pgm')
+        self.map_img = cv2.flip(cv2.imread(map_path, cv2.IMREAD_GRAYSCALE), 0)
 
-        edges = cv2.Canny((occ == 0).astype(np.uint8) * 255, 50, 150)
+        if self.map_img is None:
+            self.get_logger().error("Failed to load map.pgm")
+            return
+
+        # Convert to occupancy grid using thresholds
+        grid = np.full_like(self.map_img, -1.0, dtype=np.float32)
+        grid[self.map_img >= int(self.free_thresh * 255)] = 1.0
+        grid[self.map_img <= int(self.occupied_thresh * 255)] = 0.0
+
+        self.occ_grid = grid
+
+        # Edge detection + Hough lines
+        edges = cv2.Canny((grid == 0).astype(np.uint8) * 255, 50, 150)
         lines = cv2.HoughLinesP(edges, 0.1, np.pi / 180, threshold=5, minLineLength=5, maxLineGap=5)
 
         if lines is None:
@@ -54,7 +73,7 @@ class Planner(Node):
         for l in lines:
             all_lines.extend(self.split_line(*l[0], self.max_line_length_m, res))
 
-        poses, _ = self.generate_camera_targets(all_lines, occ, res, origin, height, start_target_id=1000)
+        poses, _ = self.generate_camera_targets(all_lines, grid, res, origin, height, start_target_id=1000)
         markers = self.generate_markers(poses)
         self.pub_markers.publish(markers)
         self.get_logger().info(f"✅ Published {len(markers.markers)} markers")
@@ -88,7 +107,7 @@ class Planner(Node):
 
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            mid_pix = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
+            mid_pix = np.array([(x1 + x2)/2, (y1 + y2)/2])
             mid_world = self.pixel_to_world(mid_pix[0], mid_pix[1], res, origin, height)
             dir_vec = np.array([x2 - x1, y2 - y1], dtype=np.float32)
             if np.linalg.norm(dir_vec) == 0:

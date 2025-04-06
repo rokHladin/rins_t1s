@@ -68,7 +68,7 @@ class detect_faces(Node):
 
         self.model = YOLO("yolov8n.pt")
 
-        package_share_dir = get_package_share_directory('dis_tutorial3')
+        package_share_dir = get_package_share_directory('t1s')
         self.face_groups = []
         self.saved_faces_file = os.path.join(package_share_dir, 'face_positions.json')
 

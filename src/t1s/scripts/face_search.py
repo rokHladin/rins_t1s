@@ -2,14 +2,19 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
-from nav_msgs.msg import OccupancyGrid
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 import math
 import numpy as np
 import transforms3d.euler
+
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+
 from robot_commander import RobotCommander
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 
 class InspectionNavigator(Node):
@@ -18,14 +23,14 @@ class InspectionNavigator(Node):
 
         qos = QoSProfile(
             depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
 
-        self.sub_markers = self.create_subscription(MarkerArray, '/inspection_markers', self.markers_callback, qos)
         self.sub_map = self.create_subscription(OccupancyGrid, '/map', self.map_callback, qos)
+        self.sub_markers = self.create_subscription(MarkerArray, '/inspection_markers', self.markers_callback, qos)
         self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.pub_rviz = self.create_publisher(MarkerArray, '/inspection_markers', qos)
+
         self.pub_visited = self.create_publisher(MarkerArray, '/visited_inspection_markers', 10)
 
         self.occupancy = None
@@ -36,8 +41,24 @@ class InspectionNavigator(Node):
         self.cam_poses = []
         self.active_goal = None
 
-        self.timer = self.create_timer(1.0, self.loop)
         self.cmdr = RobotCommander()
+        self.timer = self.create_timer(1.0, self.loop)
+
+        self.bridge = CvBridge()
+        self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
+        self.latest_image = None
+
+    def image_callback(self, msg):
+        try:
+            self.latest_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            cv2.imshow("Camera View", self.latest_image)
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC to quit
+                rclpy.shutdown()
+        except Exception as e:
+            self.get_logger().error(f"❌ Error converting image: {e}")
+
+
 
     def map_callback(self, msg):
         self.resolution = msg.info.resolution
@@ -53,7 +74,7 @@ class InspectionNavigator(Node):
         cam_map = {}
 
         for m in msg.markers:
-            if m.type == Marker.ARROW and m.color.b > 0.9:
+            if m.ns == "inspection" and m.type == Marker.ARROW and m.color.b > 0.9:
                 yaw = self.quaternion_to_yaw(m.pose.orientation)
                 cam_map[m.id] = {
                     'pose': (m.pose.position.x, m.pose.position.y, yaw),
@@ -62,22 +83,30 @@ class InspectionNavigator(Node):
                     'marker_id': m.id
                 }
 
+        green_count = 0
+        assigned_count = 0
+
         for m in msg.markers:
-            if m.type == Marker.ARROW and m.color.g > 0.9:
-                if len(m.points) >= 2:
-                    p1 = m.points[0]
-                    p2 = m.points[1]
-                    nx = p2.x - p1.x
-                    ny = p2.y - p1.y
-                    norm = math.hypot(nx, ny)
-                    if norm == 0:
-                        continue
-                    nx /= norm
-                    ny /= norm
-                    marker_id = m.id
-                    if cam_map:
-                        closest_cam = min(cam_map.values(), key=lambda c: math.hypot(c['pose'][0] - p1.x, c['pose'][1] - p1.y))
-                        closest_cam['targets'].append((p1.x, p1.y, nx, ny, marker_id))
+            if m.type == Marker.ARROW and m.color.g > 0.9 and m.ns == "inspection":
+                # Extract normal direction from quaternion
+                q = m.pose.orientation
+                _, _, yaw = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])
+                nx = math.cos(yaw)
+                ny = math.sin(yaw)
+                tx = m.pose.position.x
+                ty = m.pose.position.y
+                marker_id = m.id
+                green_count += 1
+
+                if cam_map:
+                    closest_cam = min(
+                        cam_map.values(),
+                        key=lambda c: math.hypot(c['pose'][0] - tx, c['pose'][1] - ty)
+                    )
+                    closest_cam['targets'].append((tx, ty, nx, ny, marker_id))
+                    assigned_count += 1
+
+        self.get_logger().info(f"🟢 Total green markers: {green_count}, assigned to cameras: {assigned_count}")
 
         self.cam_poses = list(cam_map.values())
         self.get_logger().info(f"🟦 Loaded {len(self.cam_poses)} camera poses")
@@ -93,27 +122,33 @@ class InspectionNavigator(Node):
         return transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
 
     def loop(self):
-
-        if self.robot_pose is None or not self.cam_poses or self.occupancy is None:
+        if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
 
         if self.active_goal:
             any_seen = False
+
+            # Go through all targets of the pose
             for i, (tx, ty, nx, ny, marker_id) in enumerate(self.active_goal['targets']):
                 if i in self.active_goal['seen']:
                     continue
+
+                # For each check if it is visible from current position
                 if self.is_visible(self.robot_pose, (tx, ty), (nx, ny)):
                     self.active_goal['seen'].add(i)
                     any_seen = True
 
             if any_seen:
-                self.get_logger().info("👀 Some green targets seen. Updating RViz...")
-                self.publish_filtered_markers()
+                self.get_logger().info("👀 Some green targets seen. Deleting from RViz...")
 
             if len(self.active_goal['seen']) == len(self.active_goal['targets']):
                 self.get_logger().info("✅ All targets seen. Canceling move.")
+                # Cancel task
                 self.cmdr.cancelTask()
+
+                # Show the seen position as marker
                 self.publish_visited_markers(self.active_goal)
+                # Reset activet goal = None
                 self.active_goal = None
                 return
 
@@ -121,40 +156,32 @@ class InspectionNavigator(Node):
                 return
             else:
                 self.get_logger().info("🏁 Arrived at goal.")
+
+                # Show the seen position as marker
                 self.publish_visited_markers(self.active_goal)
+                # Reset active goal = None
                 self.active_goal = None
 
         if self.cam_poses:
+            # Choose the next closest goal
             next_goal = min(self.cam_poses, key=lambda c: self.distance(self.robot_pose, c['pose']))
+            # Remove from poses
             self.cam_poses.remove(next_goal)
+            if 'seen' not in next_goal:
+                next_goal['seen'] = set()
+
+            # active goal = a pose object with targets and all
             self.active_goal = next_goal
             pose = next_goal['pose']
             self.get_logger().info(f"➡️ Going to next pose at {pose}, distance: {self.distance(self.robot_pose, pose):.2f}")
+            # Go to pose
             self.cmdr.goToPose(pose)
 
-    def bresenham(self, x0, y0, x1, y1):
-        """Yield integer points on line from (x0, y0) to (x1, y1) using Bresenham's algorithm"""
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        while True:
-            yield x0, y0
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 >= dy:
-                err += dy
-                x0 += sx
-            if e2 <= dx:
-                err += dx
-                y0 += sy
+    # TODO: maze distance
+    def distance(self, p1, p2):
+        return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-
-    def is_visible(self, robot_pose, target, normal, min_angle_deg=45):
-        self.get_logger().info(f"⛔")
-
+    def is_visible(self, robot_pose, target, normal, fov_deg=90, min_angle_deg=45):
         if self.occupancy is None or self.resolution is None or self.origin is None:
             return False
 
@@ -168,23 +195,20 @@ class InspectionNavigator(Node):
         if dist == 0:
             return False
 
-        # Check angle between robot heading and target vector
+        # 🔍 FIELD OF VIEW CHECK
         view_angle = math.atan2(dy, dx)
-        angle_to_center = abs((ryaw - view_angle + math.pi) % (2 * math.pi) - math.pi)
-        if angle_to_center > math.radians(45):
-            self.get_logger().info(f"⛔ Angle to target too steep: {math.degrees(angle_to_center):.1f}°")
+        angle_to_heading = abs((ryaw - view_angle + math.pi) % (2 * math.pi) - math.pi)
+
+        if angle_to_heading > math.radians(fov_deg / 2):
             return False
 
-        # Check normal angle (for surface-facing inspection)
+        # 📏 NORMAL ANGLE CHECK
         dot = (dx * nx + dy * ny) / (dist * math.hypot(nx, ny))
         angle_to_normal = math.acos(dot)
-        self.get_logger().info(f"⛔")
-
         if angle_to_normal < math.radians(min_angle_deg):
-            self.get_logger().info(f"⛔ Not steep enough against surface normal: {math.degrees(angle_to_normal):.1f}°")
             return False
 
-        # Check line of sight (Bresenham)
+        # 🧱 LINE OF SIGHT CHECK (Bresenham)
         rx_pix = int((rx - self.origin.x) / self.resolution)
         ry_pix = int((ry - self.origin.y) / self.resolution)
         tx_pix = int((tx - self.origin.x) / self.resolution)
@@ -198,65 +222,29 @@ class InspectionNavigator(Node):
 
         return True
 
-    
-    def has_line_of_sight(self, start, end):
-        if self.occupancy is None or self.resolution is None or self.origin is None:
-            return False
 
-        def to_grid(p):
-            gx = int((p[0] - self.origin.x) / self.resolution)
-            gy = int((p[1] - self.origin.y) / self.resolution)
-            return gx, gy
 
-        x0, y0 = to_grid(start)
-        x1, y1 = to_grid(end)
-
+    def bresenham(self, x0, y0, x1, y1):
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
-        x, y = x0, y0
         sx = -1 if x0 > x1 else 1
         sy = -1 if y0 > y1 else 1
-        if dx > dy:
-            err = dx / 2.0
-            while x != x1:
-                if self.occupancy[y, x] != 1.0:
-                    return False
+        err = dx - dy
+        while True:
+            yield x0, y0
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
                 err -= dy
-                if err < 0:
-                    y += sy
-                    err += dx
-                x += sx
-        else:
-            err = dy / 2.0
-            while y != y1:
-                if self.occupancy[y, x] != 1.0:
-                    return False
-                err -= dx
-                if err < 0:
-                    x += sx
-                    err += dy
-                y += sy
-        return True
-
-    def distance(self, pose1, pose2):
-        return math.hypot(pose1[0] - pose2[0], pose1[1] - pose2[1])
-
-    def publish_filtered_markers(self):
-        ma = MarkerArray()
-        for cam in self.cam_poses + ([self.active_goal] if self.active_goal else []):
-            for i in cam['seen']:
-                _, _, _, _, marker_id = cam['targets'][i]
-                marker = Marker()
-                marker.header.frame_id = "map"
-                marker.ns = "inspection"
-                marker.id = marker_id
-                marker.action = Marker.DELETE
-                ma.markers.append(marker)
-        self.pub_rviz.publish(ma)
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
 
     def publish_visited_markers(self, cam):
+        # Publishes the finished position and all targets that were seen for that position
         ma = MarkerArray()
-
         for i in cam['seen']:
             tx, ty, *_ = cam['targets'][i]
             m = Marker()
@@ -276,7 +264,6 @@ class InspectionNavigator(Node):
             m.color.a = 1.0
             ma.markers.append(m)
 
-        # Also mark the camera itself
         x, y, _ = cam['pose']
         m = Marker()
         m.header.frame_id = "map"
