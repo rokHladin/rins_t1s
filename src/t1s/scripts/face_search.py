@@ -40,7 +40,7 @@ class InspectionNavigator(Node):
 
         self.create_subscription(
             DetectedFace,
-            '/detected_face',
+            '/detected_faces',
             self.face_callback,
             qos_profile_sensor_data
         )
@@ -61,10 +61,16 @@ class InspectionNavigator(Node):
         self.cam_poses = []
         self.active_goal = None
 
+        self.seen_faces = set()
+
         self.face_queue = deque()
         self.ring_queue = deque()
         self.interrupting = False
         self.resume_after_interrupt = None
+        self.interrupting = False
+        self.waiting_for_interrupt_completion = False  # <-- NEW
+        self.resume_after_interrupt = None
+
 
         self.cmdr = RobotCommander()
         self.timer = self.create_timer(1.0, self.loop)
@@ -73,15 +79,31 @@ class InspectionNavigator(Node):
         self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
         self.latest_image = None
 
-    def face_callback(self, msg: DetectedFace):
-        self.get_logger().info(f"👤 Received face at ({msg.position.x:.2f}, {msg.position.y:.2f})")
 
-        # Extract position and normal
+    def face_callback(self, msg: DetectedFace):
+        new_pos = np.array([msg.position.x, msg.position.y])
+
+        # Check if face is within 0.3m of any previously seen face
+        for seen_pos in self.seen_faces:
+            if np.linalg.norm(new_pos - np.array(seen_pos)) < 0.3:
+                return  # Too close to a previously seen face
+
+        # If it's a new one, add to seen
+        self.seen_faces.add((msg.position.x, msg.position.y))
+
+        # Convert face into pose
         face_pos = (msg.position.x, msg.position.y)
         normal = (msg.normal.x, msg.normal.y)
 
-        # Buffer the face (assuming self.face_queue exists)
+        # Prevent excessive closeness duplicates
+        for pos, _ in self.face_queue:
+            if math.hypot(pos[0] - face_pos[0], pos[1] - face_pos[1]) < 0.3:
+                return
+
         self.face_queue.append((face_pos, normal))
+        self.get_logger().info(f"👤 Received new face at ({new_pos})")
+
+    
 
 
     def ring_callback(self, msg):
@@ -166,48 +188,64 @@ class InspectionNavigator(Node):
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
 
-        # If we are currently interrupting for face or ring and task is finished, resume inspection
-        if self.interrupting and self.cmdr.isTaskComplete():
-            self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
-            self.interrupting = False
-            if self.resume_after_interrupt:
-                self.active_goal = self.resume_after_interrupt
-                self.resume_after_interrupt = None
-                self.cmdr.goToPose(self.active_goal['pose'])
+        # 🟡 Handle interrupt goal execution
+        if self.interrupting:
+            # Wait for task to begin
+            if self.waiting_for_interrupt_completion:
+                if not self.cmdr.isTaskComplete():
+                    self.waiting_for_interrupt_completion = False
+                return
+
+            # Task running, check for completion
+            if self.cmdr.isTaskComplete():
+                self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
+
+                self.interrupting = False
+                self.waiting_for_interrupt_completion = False  # <-- FIXED: ensure it's reset
+
+                if self.resume_after_interrupt:
+                    self.active_goal = self.resume_after_interrupt
+                    self.resume_after_interrupt = None
+                    self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
+                else:
+                    self.get_logger().info("🕵️ No resume goal, waiting for next inspection target.")
+
+                return
+            else:
+                return
+
+        
+        # 🔁 Check for interruptions
+        if self.face_queue:
+            face = self.face_queue.popleft()
+            self.get_logger().info(f"🧠 Navigating to detected face at {face}")
+            self.resume_after_interrupt = self.active_goal
+            self.active_goal = None
+            self.interrupting = True
+            self.waiting_for_interrupt_completion = True
+
+            x, y = face[0]
+            yaw = math.atan2(-face[1][1], -face[1][0])
+            self.cmdr.goToPose((x, y, yaw))
             return
 
-        # Check for face/ring interruptions
-        if not self.interrupting:
-            if self.face_queue:
-                face = self.face_queue.popleft()
-                self.get_logger().info(f"🧠 Navigating to detected face at {face}")
-                self.resume_after_interrupt = self.active_goal
-                self.active_goal = None
-                self.interrupting = True
+        elif self.ring_queue:
+            ring = self.ring_queue.popleft()
+            self.get_logger().info(f"🟡 Navigating to detected ring at {ring}")
+            self.resume_after_interrupt = self.active_goal
+            self.active_goal = None
+            self.interrupting = True
+            self.waiting_for_interrupt_completion = True
 
-                # WHAT TO DO ON FACE INTERRUPT 
-                self.cmdr.goToPose(face)
-                return
-            elif self.ring_queue:
-                ring = self.ring_queue.popleft()
-                self.get_logger().info(f"🟡 Navigating to detected ring at {ring}")
-                self.resume_after_interrupt = self.active_goal
-                self.active_goal = None
-                self.interrupting = True
+            self.cmdr.goToPose(ring)
+            return
 
-                # WHAT TO DO ON RING INTERRUPT
-                self.cmdr.goToPose(ring)
-                return
-
+        # 📸 Main inspection loop
         if self.active_goal:
             any_seen = False
-
-            # Go through all targets of the pose
             for i, (tx, ty, nx, ny, marker_id) in enumerate(self.active_goal['targets']):
                 if i in self.active_goal['seen']:
                     continue
-
-                # For each check if it is visible from current position
                 if self.is_visible(self.robot_pose, (tx, ty), (nx, ny)):
                     self.active_goal['seen'].add(i)
                     any_seen = True
@@ -217,12 +255,8 @@ class InspectionNavigator(Node):
 
             if len(self.active_goal['seen']) == len(self.active_goal['targets']):
                 self.get_logger().info("✅ All targets seen. Canceling move.")
-                # Cancel task
                 self.cmdr.cancelTask()
-
-                # Show the seen position as marker
                 self.publish_visited_markers(self.active_goal)
-                # Reset activet goal = None
                 self.active_goal = None
                 return
 
@@ -230,29 +264,18 @@ class InspectionNavigator(Node):
                 return
             else:
                 self.get_logger().info("🏁 Arrived at goal.")
-
-                # Show the seen position as marker
                 self.publish_visited_markers(self.active_goal)
-                # Reset active goal = None
                 self.active_goal = None
 
         if self.cam_poses:
-            # Choose the next closest goal
-            next_goal = min(
-                self.cam_poses,
-                key=lambda c: self.astar_path_length(self.robot_pose, c['pose'])
-            )
-            # Remove from poses
+            next_goal = min(self.cam_poses, key=lambda c: self.astar_path_length(self.robot_pose, c['pose']))
             self.cam_poses.remove(next_goal)
             if 'seen' not in next_goal:
                 next_goal['seen'] = set()
-
-            # active goal = a pose object with targets and all
             self.active_goal = next_goal
-            pose = next_goal['pose']
-            self.get_logger().info(f"➡️ Going to next pose at {pose}")
-            # Go to pose
-            self.cmdr.goToPose(pose)
+            self.get_logger().info(f"➡️ Going to next pose at {next_goal['pose']}")
+            self.cmdr.goToPose(next_goal['pose'])
+
 
     def is_visible(self, robot_pose, target, normal, fov_deg=90, min_angle_deg=45):
         if self.occupancy is None or self.resolution is None or self.origin is None:

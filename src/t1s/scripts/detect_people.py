@@ -18,8 +18,7 @@ import tf2_ros
 import tf2_geometry_msgs
 from ultralytics import YOLO
 
-from t1s.msg import DetectedFace  # Custom message: includes geometry_msgs/Point and Vector3
-
+from t1s.msg import DetectedFace  # Custom message
 
 class FaceDetector(Node):
     def __init__(self):
@@ -85,7 +84,7 @@ class FaceDetector(Node):
             if normal is None:
                 continue
 
-            # Flip normal to face camera
+            # Flip normal to face the camera
             camera_origin = np.array([0.0, 0.0, 0.0])
             to_centroid = centroid - camera_origin
             if np.dot(normal, to_centroid) > 0:
@@ -94,20 +93,18 @@ class FaceDetector(Node):
             offset = centroid + normal * 0.5
 
             try:
-                # Use latest available transform
-                now = self.get_clock().now().to_msg()
-
+                # Properly create PointStamped
                 stamped = PointStamped()
-                stamped.header.stamp = now
+                stamped.header.stamp = self.get_clock().now().to_msg()
                 stamped.header.frame_id = msg.header.frame_id
                 stamped.point.x = float(offset[0])
                 stamped.point.y = float(offset[1])
                 stamped.point.z = float(offset[2])
 
                 transform = self.tf_buffer.lookup_transform(
-                    "map",
-                    msg.header.frame_id,
-                    rclpy.time.Time(),
+                    target_frame="map",
+                    source_frame=msg.header.frame_id,
+                    time=rclpy.time.Time(),  # latest available
                     timeout=rclpy.duration.Duration(seconds=0.5)
                 )
 
@@ -120,8 +117,6 @@ class FaceDetector(Node):
 
             except Exception as e:
                 self.get_logger().warn(f"TF transform failed: {e}")
-
-
 
     def fit_plane(self, points, threshold=0.015, max_iters=100):
         best_inliers = []
@@ -155,7 +150,7 @@ class FaceDetector(Node):
                 group['points'].append(new_point)
                 group['normals'].append(normal)
                 return
-        self.face_groups.append({'points': [new_point], 'normals': [normal]})
+        self.face_groups.append({'points': [new_point], 'normals': [normal], 'point': new_point})
 
     def publish_new_faces(self):
         for group in self.face_groups:
