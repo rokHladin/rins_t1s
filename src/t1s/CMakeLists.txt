@@ -11,12 +11,20 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
-
-find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 
 find_package(std_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+set(msg_files
+  "msg/DetectedFace.msg"
+)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${msg_files}
+  DEPENDENCIES std_msgs geometry_msgs
+)
 
 install(DIRECTORY
   launch
@@ -32,6 +40,10 @@ install(PROGRAMS
   scripts/planner.py
   scripts/face_search.py
   scripts/detect_rings.py
-  DESTINATION lib/${PROJECT_NAME})
+  scripts/planner_mock.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()
+

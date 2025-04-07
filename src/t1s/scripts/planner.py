@@ -19,61 +19,64 @@ class Planner(Node):
         super().__init__('inspection_marker_publisher')
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_markers = self.create_publisher(MarkerArray, '/inspection_markers', qos)
-
         self.sub_map = self.create_subscription(OccupancyGrid, '/map', self.map_callback, qos)
 
         self.map_received = False
         self.map_img = None
-        self.occ_grid = None
+        self.dist_transform = None
+        self.resolution = None
 
-        # Parameters from map.yaml
+        # Thresholds from map.yaml
         self.occupied_thresh = 0.90
         self.free_thresh = 0.25
 
+        # Marker generation settings
         self.cam_offset = 0.5
         self.target_offset = 0.1
         self.spacing = 0.3
         self.max_line_length_m = 2.0
+        self.min_clearance_m = 0.3
 
     def map_callback(self, msg):
         if self.map_received:
             return
         self.map_received = True
 
-        res = msg.info.resolution
+        self.resolution = msg.info.resolution
         origin = msg.info.origin.position
         width = msg.info.width
         height = msg.info.height
 
-        # Load map.pgm from package
+        # Load and flip PGM map (origin is at bottom left)
         package_path = get_package_share_directory('t1s')
         map_path = os.path.join(package_path, 'maps', 'map.pgm')
-        self.map_img = cv2.flip(cv2.imread(map_path, cv2.IMREAD_GRAYSCALE), 0)
-
-        if self.map_img is None:
-            self.get_logger().error("Failed to load map.pgm")
+        img = cv2.imread(map_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            self.get_logger().error("❌ Failed to load map.pgm")
             return
+        self.map_img = cv2.flip(img, 0)
 
-        # Convert to occupancy grid using thresholds
-        grid = np.full_like(self.map_img, -1.0, dtype=np.float32)
-        grid[self.map_img >= int(self.free_thresh * 255)] = 1.0
-        grid[self.map_img <= int(self.occupied_thresh * 255)] = 0.0
+        # Generate occupancy map
+        occ = np.full_like(self.map_img, -1.0, dtype=np.float32)
+        occ[self.map_img >= int(self.free_thresh * 255)] = 1.0
+        occ[self.map_img <= int(self.occupied_thresh * 255)] = 0.0
 
-        self.occ_grid = grid
+        # Compute distance transform (for clearance)
+        binary = (occ == 1.0).astype(np.uint8)
+        self.dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
 
-        # Edge detection + Hough lines
-        edges = cv2.Canny((grid == 0).astype(np.uint8) * 255, 50, 150)
+        # Detect walls and lines
+        edges = cv2.Canny((occ == 0).astype(np.uint8) * 255, 50, 150)
         lines = cv2.HoughLinesP(edges, 0.1, np.pi / 180, threshold=5, minLineLength=5, maxLineGap=5)
-
         if lines is None:
             self.get_logger().warn("No walls detected.")
             return
 
         all_lines = []
         for l in lines:
-            all_lines.extend(self.split_line(*l[0], self.max_line_length_m, res))
+            all_lines.extend(self.split_line(*l[0], self.max_line_length_m, self.resolution))
 
-        poses, _ = self.generate_camera_targets(all_lines, grid, res, origin, height, start_target_id=1000)
+        poses, _ = self.generate_camera_targets(all_lines, occ, self.resolution, origin, height, start_target_id=1000)
         markers = self.generate_markers(poses)
         self.pub_markers.publish(markers)
         self.get_logger().info(f"✅ Published {len(markers.markers)} markers")
@@ -91,12 +94,25 @@ class Planner(Node):
         y = origin.y + y_pix * res
         return np.array([x, y])
 
+    def world_to_pixel(self, wx, wy, origin, res):
+        px = int((wx - origin.x) / res)
+        py = int((wy - origin.y) / res)
+        return px, py
+
     def is_valid(self, x, y, grid, buf=1):
         x, y = int(round(x)), int(round(y))
         if x < buf or y < buf or x >= grid.shape[1] - buf or y >= grid.shape[0] - buf:
             return False
         region = grid[y - buf:y + buf + 1, x - buf:x + buf + 1]
         return np.all(region == 1.0)
+
+    def has_clearance(self, wx, wy, origin):
+        if self.dist_transform is None:
+            return True
+        px, py = self.world_to_pixel(wx, wy, origin, self.resolution)
+        if 0 <= px < self.dist_transform.shape[1] and 0 <= py < self.dist_transform.shape[0]:
+            return self.dist_transform[py, px] * self.resolution >= self.min_clearance_m
+        return False
 
     def generate_camera_targets(self, lines, grid, res, origin, height, start_target_id=1000):
         spacing_px = self.spacing / res
@@ -131,8 +147,8 @@ class Planner(Node):
                     continue
 
                 center_offset = mid_pix + direction * cam_offset_px * norm_vec
-                if self.is_valid(center_offset[0], center_offset[1], grid):
-                    wp = self.pixel_to_world(center_offset[0], center_offset[1], res, origin, height)
+                wp = self.pixel_to_world(center_offset[0], center_offset[1], res, origin, height)
+                if self.is_valid(center_offset[0], center_offset[1], grid) and self.has_clearance(wp[0], wp[1], origin):
                     yaw = math.atan2(mid_world[1] - wp[1], mid_world[0] - wp[0])
                     poses.append({'pose': (wp[0], wp[1], yaw), 'targets': targets})
 

@@ -9,12 +9,17 @@ from rclpy.qos import qos_profile_sensor_data
 import math
 import numpy as np
 import transforms3d.euler
+import heapq
+from collections import deque
+from geometry_msgs.msg import PointStamped
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import cv2
 
 from robot_commander import RobotCommander
+from t1s.msg import DetectedFace
+
 
 
 class InspectionNavigator(Node):
@@ -33,6 +38,21 @@ class InspectionNavigator(Node):
 
         self.pub_visited = self.create_publisher(MarkerArray, '/visited_inspection_markers', 10)
 
+        self.create_subscription(
+            DetectedFace,
+            '/detected_face',
+            self.face_callback,
+            qos_profile_sensor_data
+        )
+
+
+        self.create_subscription(
+            PointStamped,
+            '/ring_position',
+            self.ring_callback,
+            qos_profile_sensor_data
+        )
+
         self.occupancy = None
         self.resolution = None
         self.origin = None
@@ -41,12 +61,33 @@ class InspectionNavigator(Node):
         self.cam_poses = []
         self.active_goal = None
 
+        self.face_queue = deque()
+        self.ring_queue = deque()
+        self.interrupting = False
+        self.resume_after_interrupt = None
+
         self.cmdr = RobotCommander()
         self.timer = self.create_timer(1.0, self.loop)
 
         self.bridge = CvBridge()
         self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
         self.latest_image = None
+
+    def face_callback(self, msg: DetectedFace):
+        self.get_logger().info(f"👤 Received face at ({msg.position.x:.2f}, {msg.position.y:.2f})")
+
+        # Extract position and normal
+        face_pos = (msg.position.x, msg.position.y)
+        normal = (msg.normal.x, msg.normal.y)
+
+        # Buffer the face (assuming self.face_queue exists)
+        self.face_queue.append((face_pos, normal))
+
+
+    def ring_callback(self, msg):
+        self.get_logger().info(f"🔔 Ring detected at ({msg.point.x:.2f}, {msg.point.y:.2f})")
+        self.ring_queue.append((msg.point.x, msg.point.y, 0.0))  # Optional: Add yaw
+
 
     def image_callback(self, msg):
         try:
@@ -125,6 +166,39 @@ class InspectionNavigator(Node):
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
 
+        # If we are currently interrupting for face or ring and task is finished, resume inspection
+        if self.interrupting and self.cmdr.isTaskComplete():
+            self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
+            self.interrupting = False
+            if self.resume_after_interrupt:
+                self.active_goal = self.resume_after_interrupt
+                self.resume_after_interrupt = None
+                self.cmdr.goToPose(self.active_goal['pose'])
+            return
+
+        # Check for face/ring interruptions
+        if not self.interrupting:
+            if self.face_queue:
+                face = self.face_queue.popleft()
+                self.get_logger().info(f"🧠 Navigating to detected face at {face}")
+                self.resume_after_interrupt = self.active_goal
+                self.active_goal = None
+                self.interrupting = True
+
+                # WHAT TO DO ON FACE INTERRUPT 
+                self.cmdr.goToPose(face)
+                return
+            elif self.ring_queue:
+                ring = self.ring_queue.popleft()
+                self.get_logger().info(f"🟡 Navigating to detected ring at {ring}")
+                self.resume_after_interrupt = self.active_goal
+                self.active_goal = None
+                self.interrupting = True
+
+                # WHAT TO DO ON RING INTERRUPT
+                self.cmdr.goToPose(ring)
+                return
+
         if self.active_goal:
             any_seen = False
 
@@ -164,7 +238,10 @@ class InspectionNavigator(Node):
 
         if self.cam_poses:
             # Choose the next closest goal
-            next_goal = min(self.cam_poses, key=lambda c: self.distance(self.robot_pose, c['pose']))
+            next_goal = min(
+                self.cam_poses,
+                key=lambda c: self.astar_path_length(self.robot_pose, c['pose'])
+            )
             # Remove from poses
             self.cam_poses.remove(next_goal)
             if 'seen' not in next_goal:
@@ -173,26 +250,25 @@ class InspectionNavigator(Node):
             # active goal = a pose object with targets and all
             self.active_goal = next_goal
             pose = next_goal['pose']
-            self.get_logger().info(f"➡️ Going to next pose at {pose}, distance: {self.distance(self.robot_pose, pose):.2f}")
+            self.get_logger().info(f"➡️ Going to next pose at {pose}")
             # Go to pose
             self.cmdr.goToPose(pose)
-
-    # TODO: maze distance
-    def distance(self, p1, p2):
-        return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
     def is_visible(self, robot_pose, target, normal, fov_deg=90, min_angle_deg=45):
         if self.occupancy is None or self.resolution is None or self.origin is None:
             return False
 
         rx, ry, ryaw = robot_pose
+        #ryaw = ryaw + math.pi/4
         tx, ty = target
         nx, ny = normal
 
         dx = tx - rx
         dy = ty - ry
         dist = math.hypot(dx, dy)
+        #skip = False
         if dist == 0:
+            #skip = True
             return False
 
         # 🔍 FIELD OF VIEW CHECK
@@ -200,12 +276,29 @@ class InspectionNavigator(Node):
         angle_to_heading = abs((ryaw - view_angle + math.pi) % (2 * math.pi) - math.pi)
 
         if angle_to_heading > math.radians(fov_deg / 2):
+            #skip = True
             return False
 
         # 📏 NORMAL ANGLE CHECK
-        dot = (dx * nx + dy * ny) / (dist * math.hypot(nx, ny))
-        angle_to_normal = math.acos(dot)
-        if angle_to_normal < math.radians(min_angle_deg):
+        heading_x = math.cos(ryaw)
+        heading_y = math.sin(ryaw)
+
+        norm_len = math.hypot(nx, ny)
+        if norm_len == 0:
+            #skip = True
+            angle = 999.0
+            return False
+        else:
+            nx /= norm_len
+            ny /= norm_len
+
+            # Flip normal (we want to face *into* it)
+            dot = heading_x * -nx + heading_y * -ny
+            cos_angle = max(min(dot, 1.0), -1.0)
+            angle = math.acos(cos_angle)
+
+        if angle > math.radians(min_angle_deg):
+            #skip = True
             return False
 
         # 🧱 LINE OF SIGHT CHECK (Bresenham)
@@ -214,13 +307,19 @@ class InspectionNavigator(Node):
         tx_pix = int((tx - self.origin.x) / self.resolution)
         ty_pix = int((ty - self.origin.y) / self.resolution)
 
+        #los = True
         for x, y in self.bresenham(rx_pix, ry_pix, tx_pix, ty_pix):
             if 0 <= x < self.occupancy.shape[1] and 0 <= y < self.occupancy.shape[0]:
                 if self.occupancy[y, x] != 1:
-                    self.get_logger().info(f"⛔ Line of sight blocked at ({x}, {y})")
+                    #los = False
+                    #skip = True
                     return False
 
-        return True
+        #self.get_logger().info(f"Cam yaw (std) = {math.degrees(ryaw):.1f}°, Robot pos = ({rx:.1f}, {ry:.1f}), view_angle = {math.degrees(view_angle):.1f}")
+        #self.get_logger().info(f"Target pos = ({tx:.1f}, {ty:.1f}), FOV angle = {math.degrees(angle_to_heading):.1f}°, Facing angle = {math.degrees(angle):.1f}°, LOS = {los}")
+
+        return True #not skip
+
 
 
 
@@ -283,6 +382,47 @@ class InspectionNavigator(Node):
         ma.markers.append(m)
 
         self.pub_visited.publish(ma)
+
+    def astar_path_length(self, p1, p2):
+        if self.occupancy is None or self.resolution is None:
+            return float('inf')
+
+        start = (int((p1[0] - self.origin.x) / self.resolution), int((p1[1] - self.origin.y) / self.resolution))
+        goal = (int((p2[0] - self.origin.x) / self.resolution), int((p2[1] - self.origin.y) / self.resolution))
+
+        return self.astar(start, goal, self.occupancy)
+
+    def astar(self, start, goal, grid):
+        height, width = grid.shape
+        visited = set()
+        queue = [(0 + self.heuristic(start, goal), 0, start)]
+        g_score = {start: 0}
+
+        while queue:
+            _, cost, current = heapq.heappop(queue)
+            if current == goal:
+                return cost
+            if current in visited:
+                continue
+            visited.add(current)
+
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)]:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if not (0 <= neighbor[0] < width and 0 <= neighbor[1] < height):
+                    continue
+                if grid[neighbor[1], neighbor[0]] != 1:
+                    continue
+
+                tentative_g = g_score[current] + math.hypot(dx, dy)
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    g_score[neighbor] = tentative_g
+                    priority = tentative_g + self.heuristic(neighbor, goal)
+                    heapq.heappush(queue, (priority, tentative_g, neighbor))
+
+        return float('inf')
+
+    def heuristic(self, a, b):
+        return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
 def main(args=None):

@@ -1,304 +1,196 @@
 #!/usr/bin/env python3
 
 import rclpy
-import os
 import math
-import json
 import random
-
-from ament_index_python.packages import get_package_share_directory
+import numpy as np
+import cv2
 
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
-
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
+from geometry_msgs.msg import PointStamped, Vector3
+from std_msgs.msg import Header
+from cv_bridge import CvBridge
 
-from visualization_msgs.msg import Marker
-from geometry_msgs.msg import PointStamped
 import tf2_ros
 import tf2_geometry_msgs
-
-from cv_bridge import CvBridge, CvBridgeError
-import cv2
-import numpy as np
-
 from ultralytics import YOLO
 
+from t1s.msg import DetectedFace  # Custom message: includes geometry_msgs/Point and Vector3
 
-class detect_faces(Node):
 
+class FaceDetector(Node):
     def __init__(self):
-        super().__init__('detect_faces')
-
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('device', ''),
-            ]
-        )
-
-        marker_topic = "/people_marker"
-
-        self.detection_color = (0, 0, 255)
-        self.device = self.get_parameter('device').get_parameter_value().string_value
+        super().__init__('detect_people')
+        self.device = self.declare_parameter('device', '').get_parameter_value().string_value
 
         self.bridge = CvBridge()
-        self.scan = None
-
-        self.rgb_image_sub = self.create_subscription(
-            Image,
-            "/oakd/rgb/preview/image_raw",
-            self.rgb_callback,
-            qos_profile_sensor_data)
-
-        self.pointcloud_sub = self.create_subscription(
-            PointCloud2,
-            "/oakd/rgb/preview/depth/points",
-            self.pointcloud_callback,
-            qos_profile_sensor_data)
-
-        self.marker_pub = self.create_publisher(
-            Marker,
-            marker_topic,
-            QoSReliabilityPolicy.BEST_EFFORT)
+        self.faces = []
+        self.face_groups = []
+        self.detected_faces_sent = set()
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.model = YOLO("yolov8n.pt")
 
-        package_share_dir = get_package_share_directory('t1s')
-        self.face_groups = []
-        self.saved_faces_file = os.path.join(package_share_dir, 'face_positions.json')
+        self.sub_rgb = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
+        self.sub_pc = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pc_callback, qos_profile_sensor_data)
 
-        self.faces = []
+        self.face_pub = self.create_publisher(DetectedFace, "/detected_faces", 10)
 
-        self.marker_timer = self.create_timer(1.0, self.publish_face_group_markers)
-        self.marker_id_counter = 0
+        self.timer = self.create_timer(1.0, self.publish_new_faces)
 
-        self.get_logger().info(f"Node has been initialized! Will publish face markers to {marker_topic}.")
+        self.get_logger().info("✅ detect_people running. Waiting for faces...")
 
-    def add_to_face_groups(self, new_point, threshold=0.5):
-        for group in self.face_groups:
-            for point in group:
-                if np.linalg.norm(point - new_point) < threshold:
-                    group.append(new_point)
-                    return
-        # No match: start new group
-        self.face_groups.append([new_point])
-
-    def write_faces_to_file(self):
-        averaged_faces = []
-
-        for group in self.face_groups:
-            avg = np.mean(group, axis=0)
-            averaged_faces.append({
-                "x": float(avg[0]),
-                "y": float(avg[1]),
-                "z": float(avg[2]),
-            })
-
-        with open(self.saved_faces_file, 'w') as f:
-            json.dump(averaged_faces, f, indent=2)
-
-        self.get_logger().info(f"Wrote {len(averaged_faces)} averaged face positions to {self.saved_faces_file}")
-
-    def publish_face_group_markers(self):
-        self.marker_id_counter = 0  # Reset IDs so they overwrite previous markers
-
-        for group in self.face_groups:
-            if len(group) == 0:
-                continue
-
-            avg = np.mean(group, axis=0)
-
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "faces"
-            marker.id = self.marker_id_counter
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = float(avg[0])
-            marker.pose.position.y = float(avg[1])
-            marker.pose.position.z = float(avg[2])
-            marker.pose.orientation.w = 1.0
-
-            marker.scale.x = 0.2
-            marker.scale.y = 0.2
-            marker.scale.z = 0.2
-
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            marker.color.a = 1.0
-
-            self.marker_pub.publish(marker)
-            self.marker_id_counter += 1
-
-        
-    def rgb_callback(self, data):
-        self.faces = []
+    def rgb_callback(self, msg):
+        self.faces.clear()
 
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-            self.get_logger().info("Running inference on image...")
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            results = self.model.predict(img, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
 
-            # run inference
-            res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
+            for r in results:
+                for bbox in r.boxes.xyxy.cpu().numpy():
+                    x1, y1, x2, y2 = map(int, bbox)
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    self.faces.append((cx, cy))
 
-            # iterate over results
-            for x in res:
-                bbox = x.boxes.xyxy
-                if bbox.nelement() == 0:
-                    continue
+        except Exception as e:
+            self.get_logger().error(f"Image processing failed: {str(e)}")
 
-                self.get_logger().info("Person has been detected!")
+    def pc_callback(self, msg):
+        if not self.faces:
+            return
 
-                bbox = bbox[0]
-                cv_image = cv2.rectangle(cv_image, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), self.detection_color, 3)
+        try:
+            pc_array = pc2.read_points_numpy(msg, field_names=("x", "y", "z")).reshape((msg.height, msg.width, 3))
+        except Exception as e:
+            self.get_logger().warn(f"Failed to parse point cloud: {e}")
+            return
 
-                cx = int((bbox[0] + bbox[2]) / 2)
-                cy = int((bbox[1] + bbox[3]) / 2)
+        for cx, cy in self.faces:
+            window = 10
+            region = pc_array[max(0, cy - window):cy + window, max(0, cx - window):cx + window, :]
+            points = region.reshape(-1, 3)
+            points = points[~np.isnan(points).any(axis=1)]
 
-                cv_image = cv2.circle(cv_image, (cx, cy), 5, self.detection_color, -1)
+            if len(points) < 30:
+                continue
 
-                self.faces.append((cx, cy))
+            normal, centroid = self.fit_plane(points)
+            if normal is None:
+                continue
 
-            cv2.imshow("image", cv_image)
-            key = cv2.waitKey(1)
-            if key == 27:
-                print("exiting")
-                exit()
+            # Flip normal to face camera
+            camera_origin = np.array([0.0, 0.0, 0.0])
+            to_centroid = centroid - camera_origin
+            if np.dot(normal, to_centroid) > 0:
+                normal = -normal
 
-        except CvBridgeError as e:
-            print(e)
+            offset = centroid + normal * 0.5
 
-    def ransac_plane_fit(self, points, threshold=0.1, max_iterations=500):
+            try:
+                # Use latest available transform
+                now = self.get_clock().now().to_msg()
+
+                stamped = PointStamped()
+                stamped.header.stamp = now
+                stamped.header.frame_id = msg.header.frame_id
+                stamped.point.x = float(offset[0])
+                stamped.point.y = float(offset[1])
+                stamped.point.z = float(offset[2])
+
+                transform = self.tf_buffer.lookup_transform(
+                    "map",
+                    msg.header.frame_id,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5)
+                )
+
+                transformed = tf2_geometry_msgs.do_transform_point(stamped, transform)
+
+                self.add_to_group(
+                    np.array([transformed.point.x, transformed.point.y, transformed.point.z]),
+                    normal
+                )
+
+            except Exception as e:
+                self.get_logger().warn(f"TF transform failed: {e}")
+
+
+
+    def fit_plane(self, points, threshold=0.015, max_iters=100):
         best_inliers = []
         best_normal = None
-        best_point = None
 
-        if len(points) < 3:
-            return None, None
-
-        points = np.array(points)
-
-        for _ in range(max_iterations):
-            # 1. Randomly select 3 distinct points
+        for _ in range(max_iters):
             sample = points[random.sample(range(len(points)), 3)]
-            p1, p2, p3 = sample
-
-            # 2. Compute the normal
-            v1 = p2 - p1
-            v2 = p3 - p1
+            v1 = sample[1] - sample[0]
+            v2 = sample[2] - sample[0]
             normal = np.cross(v1, v2)
             if np.linalg.norm(normal) == 0:
-                continue  # degenerate plane
+                continue
             normal = normal / np.linalg.norm(normal)
 
-            distances = np.abs((points - p1).dot(normal))
+            distances = np.abs(np.dot(points - sample[0], normal))
             inliers = points[distances < threshold]
 
             if len(inliers) > len(best_inliers):
                 best_inliers = inliers
                 best_normal = normal
-                best_point = p1  # or mean of inliers later
 
         if best_normal is not None and len(best_inliers) > 0:
-            # Recompute centroid if needed
-            best_point = np.mean(best_inliers, axis=0)
-            return best_normal, best_point
-        else:
-            return None, None
+            centroid = np.mean(best_inliers, axis=0)
+            return best_normal, centroid
 
-    def pointcloud_callback(self, data):
-        offset_distance = 0.5
-        height = data.height
-        width = data.width
+        return None, None
 
-        window_size = 10
+    def add_to_group(self, new_point, normal, threshold=0.5):
+        for group in self.face_groups:
+            if np.linalg.norm(group['point'] - new_point) < threshold:
+                group['points'].append(new_point)
+                group['normals'].append(normal)
+                return
+        self.face_groups.append({'points': [new_point], 'normals': [normal]})
 
-        a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
-        a = a.reshape((height, width, 3))
+    def publish_new_faces(self):
+        for group in self.face_groups:
+            avg_pos = np.mean(group['points'], axis=0)
+            avg_norm = np.mean(group['normals'], axis=0)
+            key = tuple(np.round(avg_pos, 2))
 
-        for cx, cy in self.faces:
-            # 1. Region around face
-            region = a[max(0, cy - window_size):cy + window_size,
-                       max(0, cx - window_size):cx + window_size, :]
-
-            points = region.reshape(-1, 3)
-            points = points[~np.isnan(points).any(axis=1)]
-
-            if len(points) < 30:
-                self.get_logger().warn("Not enough points for plane fitting.")
+            if key in self.detected_faces_sent:
                 continue
 
-            # Check if all points lie (approximately) on a line or point
-            spread = np.ptp(points, axis=0)  # peak-to-peak = max - min along each axis
+            msg = DetectedFace()
+            msg.header = Header()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "map"
 
-            # If the points don't span enough space in at least 2 dimensions, skip
-            if np.count_nonzero(spread > 0.01) < 2:
-                self.get_logger().warn("Points do not span enough space to define a plane.")
-                continue
-            
-            normal, face_point = self.ransac_plane_fit(points, threshold=0.015, max_iterations=100)
+            msg.position.x = float(avg_pos[0])
+            msg.position.y = float(avg_pos[1])
+            msg.position.z = float(avg_pos[2])
 
-            if normal is None:
-                self.get_logger().warn("RANSAC failed to find a valid plane.")
-                continue
+            msg.normal.x = float(avg_norm[0])
+            msg.normal.y = float(avg_norm[1])
+            msg.normal.z = float(avg_norm[2])
 
-            # Flip normal if needed
-            camera_origin = np.array([0.0, 0.0, 0.0])  # in base_link frame
-            to_face = face_point - camera_origin
-            to_face = to_face / np.linalg.norm(to_face)
+            self.face_pub.publish(msg)
+            self.detected_faces_sent.add(key)
 
-            if np.dot(normal, to_face) > 0:
-                normal = -normal
+            self.get_logger().info(f"🧍 Detected new face at {avg_pos}, normal: {avg_norm}")
 
-            offset_point = face_point + normal * offset_distance
-                            
-            offset_msg = PointStamped()
-            offset_msg.header.frame_id = "base_link"
-            offset_msg.header.stamp = data.header.stamp
-            offset_msg.point.x = float(offset_point[0])
-            offset_msg.point.y = float(offset_point[1])
-            offset_msg.point.z = float(offset_point[2])
 
-            try:
-                # Transform to map frame
-                transform = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
-                point_world = tf2_geometry_msgs.do_transform_point(offset_msg, transform)
-
-                offset_point_np = np.array([
-                    point_world.point.x,
-                    point_world.point.y,
-                    point_world.point.z
-                ])
-
-                self.add_to_face_groups(offset_point_np)
-
-                self.get_logger().info(f"Face (map frame) at {offset_point_np}")
-
-            except Exception as e:
-                self.get_logger().warn(f"TF transform failed: {str(e)}")
-        
-def main():
-    print('Face detection node starting.')
-
-    rclpy.init(args=None)
-    node = detect_faces()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Keyboard interrupt received. Saving face positions and shutting down...")
-        node.write_faces_to_file()
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+def main(args=None):
+    rclpy.init(args=args)
+    node = FaceDetector()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
