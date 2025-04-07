@@ -10,7 +10,7 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import PointStamped, Vector3, Pose
 from cv_bridge import CvBridge, CvBridgeError
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 
@@ -22,7 +22,7 @@ qos_profile = QoSProfile(
 
 class RingDetector(Node):
     def __init__(self):
-        super().__init__('transform_point')
+        super().__init__('ring_detector')
 
         # Basic ROS stuff
         timer_frequency = 2
@@ -35,117 +35,170 @@ class RingDetector(Node):
         self.marker_array = MarkerArray()
         self.marker_num = 1
 
+        # Store the latest depth image
+        self.latest_depth = None
+        
         # Subscribe to the image and/or depth topic
         self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
         self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
-
-        # Publiser for the visualization markers
-        # self.marker_pub = self.create_publisher(Marker, "/ring", QoSReliabilityPolicy.BEST_EFFORT)
+        
+        # Publisher for ring detections
+        self.ring_pub = self.create_publisher(Marker, "/detected_ring", 10)
+        self.ring_info_pub = self.create_publisher(String, "/ring_info", 10)
 
         # Object we use for transforming between coordinate frames
-        # self.tf_buf = tf2_ros.Buffer()
-        # self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        # Create windows for visualization
+        cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Binary Image", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)        
+        
+        # Parameters for ring detection
+        self.min_contour_points = 20
+        self.max_center_distance = 7.0
+        self.max_angle_diff = 6.0
+        self.min_ring_width = 2
+        self.max_ring_width = 30
+        
+        # Parameters for 3D validation
+        self.depth_threshold = 0.1  # Expected depth difference for 3D rings (in meters)
+        self.ring_depth_samples = 10  # Number of depth samples to check
 
     def image_callback(self, data):
-        self.get_logger().info(f"I got a new image!!! Will try to find rings...")
+        if self.latest_depth is None:
+            self.get_logger().info("No depth image received yet, skipping ring detection")
+            return
+
+        self.get_logger().info("Processing new image for ring detection")
 
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            depth_image = self.latest_depth.copy()
         except CvBridgeError as e:
-            print(e)
-
-        blue = cv_image[:,:,0]
-        green = cv_image[:,:,1]
-        red = cv_image[:,:,2]
+            self.get_logger().error(f"Error converting images: {e}")
+            return
 
         # Tranform image to grayscale
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # gray = red
-
-        # Apply Gaussian Blur
-        # gray = cv2.GaussianBlur(gray,(3,3),0)
-
-        # Do histogram equalization
-        # gray = cv2.equalizeHist(gray)
-
-        # Binarize the image, there are different ways to do it
-        #ret, thresh = cv2.threshold(img, 50, 255, 0)
-        #ret, thresh = cv2.threshold(img, 70, 255, cv2.THRESH_BINARY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 30)
-        cv2.imshow("Binary Image", thresh)
-        cv2.waitKey(1)
+        
+        # extract the top half of the image
+        # gray = gray[0:int(gray.shape[0]/2),:]
+        
+        # Threshold the image
+        # gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        #                                cv2.THRESH_BINARY_INV, 15, 9)
+        
+        # open + close
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
+        thresh = cv2.morphologyEx(thresh.copy(), cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        # cv2.imshow("Binary Image", thresh)
+        # cv2.waitKey(1)
 
         # Extract contours
         contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Example of how to draw the contours, only for visualization purposes
-        cv2.drawContours(gray, contours, -1, (255, 0, 0), 3)
-        cv2.imshow("Detected contours", gray)
+    
+        ring_contours = []
+        for contour in contours:
+            # Calculate circularity = 4*pi*area/perimeter^2
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                # Rings should have high circularity (closer to 1)
+                if circularity > 0.5:  # Adjust threshold based on your rings
+                    ring_contours.append(contour)
+    
+        contours = ring_contours
+        
+        # Show binary image
+        cv2.imshow("Binary Image", thresh)
         cv2.waitKey(1)
 
+        
+        # Draw contours on a copy of the grayscale image
+        contour_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(contour_image, contours, -1, (0, 255, 0), 2)
+        cv2.imshow("Detected contours", contour_image)
+        cv2.waitKey(1)
+        
         # Fit elipses to all extracted contours
-        elps = []
+        ellipses = []
         for cnt in contours:
             #     print cnt
             #     print cnt.shape
-            if cnt.shape[0] >= 20:
+            if cnt.shape[0] >= 10:
+                # ((center_x, center_y), (major_axis, minor_axis), angle)
                 ellipse = cv2.fitEllipse(cnt)
-                elps.append(ellipse)
+                print(f"\033[94mEllipse: {ellipse}\033[0m")
+                ellipses.append(ellipse)
 
-
-        # Find two elipses with same centers
-        candidates = []
-        for n in range(len(elps)):
-            for m in range(n + 1, len(elps)):
-                # e[0] is the center of the ellipse (x,y), e[1] are the lengths of major and minor axis (major, minor), e[2] is the rotation in degrees
+        # Find pairs of concentric ellipses (potential rings)
+        ring_candidates = []
+        for i in range(len(ellipses)):
+            for j in range(i + 1, len(ellipses)):
+                e1 = ellipses[i]
+                e2 = ellipses[j]
                 
-                e1 = elps[n]
-                e2 = elps[m]
-                dist = np.sqrt(((e1[0][0] - e2[0][0]) ** 2 + (e1[0][1] - e2[0][1]) ** 2))
-                angle_diff = np.abs(e1[2] - e2[2])
-
-                # The centers of the two elipses should be within 5 pixels of each other (is there a better treshold?)
-                if dist >= 5:
+                # # Calculate center distance
+                center_dist = np.sqrt(((e1[0][0] - e2[0][0]) ** 2 + (e1[0][1] - e2[0][1]) ** 2))
+                if center_dist > self.max_center_distance:
                     continue
-
-                # The rotation of the elipses should be whitin 4 degrees of eachother
-                if angle_diff>4:
+                
+                # # Check angle difference
+                angle_diff = abs(e1[2] - e2[2]) % 180
+                angle_diff = min(angle_diff, 180 - angle_diff)
+                if angle_diff > self.max_angle_diff:
                     continue
-
-                e1_minor_axis = e1[1][0]
-                e1_major_axis = e1[1][1]
-
-                e2_minor_axis = e2[1][0]
-                e2_major_axis = e2[1][1]
-
-                if e1_major_axis>=e2_major_axis and e1_minor_axis>=e2_minor_axis: # the larger ellipse should have both axis larger
-                    le = e1 # e1 is larger ellipse
-                    se = e2 # e2 is smaller ellipse
-                elif e2_major_axis>=e1_major_axis and e2_minor_axis>=e1_minor_axis:
-                    le = e2 # e2 is larger ellipse
-                    se = e1 # e1 is smaller ellipse
+                
+                # Determine which ellipse is larger
+                e1_area = np.pi * e1[1][0] * e1[1][1] / 4
+                e2_area = np.pi * e2[1][0] * e2[1][1] / 4
+                
+                if e1_area > e2_area:
+                    larger = e1
+                    smaller = e2
                 else:
-                    continue # if one ellipse does not contain the other, it is not a ring
+                    larger = e2
+                    smaller = e1
                 
-                # # The widths of the ring along the major and minor axis should be roughly the same
-                # border_major = (le[1][1]-se[1][1])/2
-                # border_minor = (le[1][0]-se[1][0])/2
-                # border_diff = np.abs(border_major - border_minor)
+                # Check if one ellipse contains the other
+                l_major, l_minor = max(larger[1]), min(larger[1])
+                s_major, s_minor = max(smaller[1]), min(smaller[1])
+                
+                # # Ring width check - difference between the radii
+                ring_width = (l_minor - s_minor) / 2
+                if ring_width < self.min_ring_width or ring_width > self.max_ring_width:
+                    continue
+                
+                # # Calculate aspect ratio of the ring
+                aspect_ratio = l_major / l_minor
+                if aspect_ratio > 1.5:  # Reject highly elliptical rings
+                    continue
+                border_major = (l_major - s_major) / 2
+                border_minor = (l_minor - s_minor) / 2
+                border_diff = np.abs(border_major - border_minor)
+                if border_diff > 5:
+                    continue
+                
+                
+                print("\033[91mRing detected\033[0m")  # Red text in terminal
+                ring_candidates.append((larger, smaller))
+                
+                # Check if ring is 3D using depth information
+                # if self.is_3d_ring(depth_image, larger[0], l_major, l_minor, smaller[0], s_major, s_minor):
+                #     print("\033[91mRing detected\033[0m")  # Red text in terminal
 
-                # if border_diff>4:
-                #     continue
-                    
-                candidates.append((e1,e2))
-
-        print("Processing is done! found", len(candidates), "candidates for rings")
-
-        # Plot the rings on the image
-        for c in candidates:
+                # Plot the rings on the image
+        for c in ring_candidates:
 
             # the centers of the ellipses
             e1 = c[0]
@@ -169,38 +222,114 @@ class RingDetector(Node):
             y_min = y1 if y1 > 0 else 0
             y_max = y2 if y2 < cv_image.shape[1] else cv_image.shape[1]
 
-        if len(candidates)>0:
+        if len(ring_candidates)>0:
                 cv2.imshow("Detected rings",cv_image)
                 cv2.waitKey(1)
 
-    def depth_callback(self,data):
-
-        try:
-            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        except CvBridgeError as e:
-            print(e)
-
-        depth_image[depth_image==np.inf] = 0
+    def is_3d_ring(self, depth_image, outer_center, outer_major, outer_minor, 
+                   inner_center, inner_major, inner_minor):
+        """
+        Validate if a ring candidate is actually a 3D ring using depth information.
+        A 3D ring should have a depth discontinuity in the middle compared to the ring itself.
+        """
+        # Get center coordinates
+        cx, cy = int(outer_center[0]), int(outer_center[1])
         
-        # Do the necessairy conversion so we can visuzalize it in OpenCV
-        image_1 = depth_image / 65536.0 * 255
-        image_1 = image_1/np.max(image_1)*255
+        # Check if center is within image bounds
+        if cx >= depth_image.shape[1] or cy >= depth_image.shape[0] or cx < 0 or cy < 0:
+            return False
+        
+        # Calculate the radius of the inner hole
+        inner_radius = min(inner_major, inner_minor) / 2
+        
+        # Calculate the outer radius 
+        outer_radius = min(outer_major, outer_minor) / 2
+        
+        # Sample depth values in the center, on the ring, and outside
+        center_depths = []
+        ring_depths = []
+        
+        # Sample points in a grid pattern
+        for angle in np.linspace(0, 2*np.pi, self.ring_depth_samples, endpoint=False):
+            # Points inside the hole (center)
+            r_center = inner_radius * 0.5
+            x_center = int(cx + r_center * np.cos(angle))
+            y_center = int(cy + r_center * np.sin(angle))
+            
+            print(f"\033[92mCenter point: ({x_center}, {y_center})\033[0m")
+            print(f"\033[92mDepth image shape: {depth_image.shape}\033[0m")
+            
+            if 0 <= x_center < depth_image.shape[1] and 0 <= y_center < depth_image.shape[0]:
+                depth = depth_image[y_center, x_center]
+                if depth > 0:
+                    center_depths.append(depth)
+            
+            # Points on the ring
+            r_ring = (inner_radius + outer_radius) / 2
+            x_ring = int(cx + r_ring * np.cos(angle))
+            y_ring = int(cy + r_ring * np.sin(angle))
+            
+            if 0 <= x_ring < depth_image.shape[1] and 0 <= y_ring < depth_image.shape[0]:
+                depth = depth_image[y_ring, x_ring]
+                if depth > 0 and not np.isinf(depth):
+                    ring_depths.append(depth)
+        
+        print(f"\033[92mCenter depths: {center_depths}\033[0m")
+        print(f"\033[92mRing depths: {ring_depths}\033[0m")
+        
+        # Check if we have enough valid depth samples
+        if len(center_depths) < 3 or len(ring_depths) < 3:
+            return False
+        
+        # Calculate median depths to reduce noise impact
+        center_depth = np.median(center_depths)
+        ring_depth = np.median(ring_depths)
+        
+        # Calculate depth difference
+        depth_diff = abs(center_depth - ring_depth)
+        
+        # If the center is significantly farther than the ring, it's likely a 3D ring
+        if depth_diff > self.depth_threshold:
+            return True
+            
+        return False
 
-        image_viz = np.array(image_1, dtype= np.uint8)
+    def depth_callback(self, data):
+        try:
+            # Convert depth image to meters
+            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
+            self.latest_depth = depth_image
+        except CvBridgeError as e:
+            self.get_logger().error(f"Error converting depth image: {e}")
+            return
 
-        cv2.imshow("Depth window", image_viz)
+        # Process the depth image for visualization
+        depth_viz = depth_image.copy()
+        depth_viz[depth_viz == np.inf] = 0
+        depth_viz[depth_viz > 10] = 10  # Cap maximum distance for visualization
+        
+        # Normalize for display
+        depth_viz_norm = depth_viz / np.max(depth_viz) if np.max(depth_viz) > 0 else depth_viz
+        depth_viz_display = (depth_viz_norm * 255).astype(np.uint8)
+        
+        # Apply a colormap for better visualization
+        depth_colormap = cv2.applyColorMap(depth_viz_display, cv2.COLORMAP_JET)
+        
+        cv2.imshow("Depth window", depth_colormap)
         cv2.waitKey(1)
 
-
 def main():
-
     rclpy.init(args=None)
-    rd_node = RingDetector()
-
-    rclpy.spin(rd_node)
-
-    cv2.destroyAllWindows()
-
+    ring_detector = RingDetector()
+    
+    try:
+        rclpy.spin(ring_detector)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ring_detector.destroy_node()
+        rclpy.shutdown()
+        cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
