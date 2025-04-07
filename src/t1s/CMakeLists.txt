@@ -31,6 +31,7 @@ install(PROGRAMS
   scripts/robot_commander.py
   scripts/planner.py
   scripts/face_search.py
+  scripts/detect_rings.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
