@@ -19,6 +19,7 @@ import cv2
 
 from robot_commander import RobotCommander
 from t1s.msg import DetectedFace
+from t1s.msg import DetectedRing
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
 
@@ -42,8 +43,7 @@ class InspectionNavigator(Node):
 
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.pushed_face_pub = self.create_publisher(Marker, '/pushed_faces', 10)
-
-
+        self.pub_ring_marker = self.create_publisher(MarkerArray, '/ring_markers', 10)
 
         self.create_subscription(
             DetectedFace,
@@ -54,11 +54,12 @@ class InspectionNavigator(Node):
 
 
         self.create_subscription(
-            PointStamped,
+            DetectedRing,
             '/ring_position',
             self.ring_callback,
             qos_profile_sensor_data
         )
+
 
         self.sub_amcl = self.create_subscription(
             PoseWithCovarianceStamped,
@@ -79,13 +80,14 @@ class InspectionNavigator(Node):
         self.active_goal = None
 
         self.seen_faces = set()
-
         self.face_queue = deque()
+
+        self.seen_rings = set()
         self.ring_queue = deque()
+        self.active_ring_goal = None
+
         self.interrupting = False
-        self.resume_after_interrupt = None
-        self.interrupting = False
-        self.waiting_for_interrupt_completion = False  # <-- NEW
+        self.waiting_for_interrupt_completion = False
         self.resume_after_interrupt = None
 
 
@@ -142,6 +144,27 @@ class InspectionNavigator(Node):
 
         self.initial_pose_pub.publish(msg)
         self.get_logger().info("📍 Published initial pose to AMCL")
+
+    def publish_ring_marker(self, position):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "rings"
+        marker.id = int(position[0] * 1000) + int(position[1] * 1000)
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = position[0]
+        marker.pose.position.y = position[1]
+        marker.pose.position.z = 0.0
+        marker.scale.x = 0.15
+        marker.scale.y = 0.15
+        marker.scale.z = 0.05
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        self.pub_ring_marker.publish(MarkerArray(markers=[marker]))
+
 
     def publish_pushed_face_marker(self, position, normal=None):
         # Red dot for the face position
@@ -235,12 +258,25 @@ class InspectionNavigator(Node):
         self.face_queue.append((safe_pos, normal))
         self.get_logger().info(f"👤 Received new face at ({new_pos})")
 
-    
+    def ring_callback(self, msg: DetectedRing):
+        new_pos = np.array([msg.position.point.x, msg.position.point.y])
+        color = msg.color.lower()
 
+        for seen_pos in self.seen_rings:
+            if np.linalg.norm(new_pos - np.array(seen_pos)) < 0.5:
+                return
 
-    def ring_callback(self, msg):
-        self.get_logger().info(f"🔔 Ring detected at ({msg.point.x:.2f}, {msg.point.y:.2f})")
-        self.ring_queue.append((msg.point.x, msg.point.y, 0.0))  # Optional: Add yaw
+        self.seen_rings.add((msg.position.point.x, msg.position.point.y))
+        ring_pos = (msg.position.point.x, msg.position.point.y)
+
+        for pos, _ in self.ring_queue:
+            if math.hypot(pos[0] - ring_pos[0], pos[1] - ring_pos[1]) < 0.5:
+                return
+
+        # Store as tuple with color
+        self.ring_queue.append((ring_pos, color))
+        # Store or log color as needed
+        self.get_logger().info(f"🔔 Ring detected at {new_pos} with color '{color}'")
 
 
     def image_callback(self, msg):
@@ -320,31 +356,56 @@ class InspectionNavigator(Node):
         #x, y, ryaw = self.robot_pose
         #self.get_logger().info(f"🔔 YAW {math.degrees(ryaw)}")
 
-        # 🟡 Handle interrupt goal execution
+        # Handle interrupt goal execution
         if self.interrupting:
-            # Wait for task to begin
+            # Handle ring goal separately
+            if self.active_ring_goal:
+                rx, ry, _ = self.robot_pose
+                tx, ty = self.active_ring_goal
+                dist = math.hypot(tx - rx, ty - ry)
+
+                if dist < 1.0:
+                    self.get_logger().info("✅ Reached ring (within 1m). Canceling goal and resuming inspection.")
+                    self.cmdr.cancelTask()
+                    self.interrupting = False
+                    self.waiting_for_interrupt_completion = False
+                    self.active_ring_goal = None
+
+                    if self.resume_after_interrupt:
+                        self.active_goal = self.resume_after_interrupt
+                        self.resume_after_interrupt = None
+                        self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
+                    return
+
+                # Wait until the navigation actually starts
+                if self.waiting_for_interrupt_completion:
+                    if not self.cmdr.isTaskComplete():
+                        self.waiting_for_interrupt_completion = False
+                    return
+
+                # Do not check isTaskComplete() for ring goal, let distance control it
+                return
+
+            # Default interrupt behavior (e.g., face goal)
             if self.waiting_for_interrupt_completion:
                 if not self.cmdr.isTaskComplete():
                     self.waiting_for_interrupt_completion = False
                 return
 
-            # Task running, check for completion
             if self.cmdr.isTaskComplete():
                 self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
 
                 self.interrupting = False
-                self.waiting_for_interrupt_completion = False  # <-- FIXED: ensure it's reset
+                self.waiting_for_interrupt_completion = False
 
                 if self.resume_after_interrupt:
                     self.active_goal = self.resume_after_interrupt
                     self.resume_after_interrupt = None
-                    self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
+                    self.cmdr.goToPose(self.active_goal['pose'])
                 else:
                     self.get_logger().info("🕵️ No resume goal, waiting for next inspection target.")
+            return
 
-                return
-            else:
-                return
 
         
         # 🔁 Check for interruptions
@@ -358,20 +419,28 @@ class InspectionNavigator(Node):
             self.interrupting = True
             self.waiting_for_interrupt_completion = True
 
+            # WHAT TO DO ON FACE DETECTION
             x, y = face[0]
             yaw = math.atan2(-face[1][1], -face[1][0])
             self.cmdr.goToPose((x, y, yaw))
             return
 
         elif self.ring_queue:
-            ring = self.ring_queue.popleft()
-            self.get_logger().info(f"🟡 Navigating to detected ring at {ring}")
+            ring, color = self.ring_queue.popleft()
+            self.get_logger().info(f"🟡 Navigating to ring at {ring} (color: {color})")
+            self.publish_ring_marker(ring)
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
             self.interrupting = True
             self.waiting_for_interrupt_completion = True
+            self.active_ring_goal = ring
 
-            self.cmdr.goToPose(ring)
+            # WHAT TO DO ON RING DETECTION
+            rx, ry, _ = self.robot_pose
+            tx, ty = ring
+            yaw = math.atan2(ty - ry, tx - rx)
+            self.cmdr.goToPose((tx, ty, yaw))
+
             return
 
         # 📸 Main inspection loop

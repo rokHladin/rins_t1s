@@ -6,19 +6,19 @@ if(NOT CMAKE_CXX_STANDARD)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rclpy REQUIRED)
-
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 set(msg_files
   "msg/DetectedFace.msg"
+  "msg/DetectedRing.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -41,6 +41,7 @@ install(PROGRAMS
   scripts/face_search.py
   scripts/detect_rings.py
   scripts/planner_mock.py
+  scripts/detect_rings_mock.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
