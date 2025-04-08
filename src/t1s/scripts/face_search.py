@@ -127,12 +127,13 @@ class InspectionNavigator(Node):
         self.initial_pose_pub.publish(msg)
         self.get_logger().info("📍 Published initial pose to AMCL")
 
-    def publish_pushed_face_marker(self, position):
+    def publish_pushed_face_marker(self, position, normal=None):
+        # Red dot for the face position
         m = Marker()
         m.header.frame_id = "map"
         m.header.stamp = self.get_clock().now().to_msg()
         m.ns = "pushed_faces"
-        m.id = int(position[0] * 1000) + int(position[1] * 1000)  # Unique-ish ID
+        m.id = int(position[0] * 1000) + int(position[1] * 1000)
         m.type = Marker.SPHERE
         m.action = Marker.ADD
         m.pose.position.x = position[0]
@@ -147,6 +148,42 @@ class InspectionNavigator(Node):
         m.color.a = 1.0
         self.pushed_face_pub.publish(m)
 
+        # Optional arrow for the normal vector
+        if normal is not None:
+            arrow = Marker()
+            arrow.header.frame_id = "map"
+            arrow.header.stamp = self.get_clock().now().to_msg()
+            arrow.ns = "pushed_faces"
+            arrow.id = m.id + 1000000
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.scale.x = 0.05  # shaft diameter
+            arrow.scale.y = 0.1   # head diameter
+            arrow.scale.z = 0.1   # head length
+            arrow.color.r = 0.0
+            arrow.color.g = 1.0
+            arrow.color.b = 0.0
+            arrow.color.a = 1.0
+
+            start = position
+            end = (
+                position[0] + normal[0] * 0.5,
+                position[1] + normal[1] * 0.5,
+                0.0
+            )
+            arrow.points.append(self.make_point(start))
+            arrow.points.append(self.make_point(end))
+
+            self.pushed_face_pub.publish(arrow)
+
+    def make_point(self, pos):
+        pt = PointStamped().point
+        pt.x = pos[0]
+        pt.y = pos[1]
+        pt.z = pos[2] if len(pos) > 2 else 0.0
+        return pt
+
+    
 
     def amcl_callback(self, msg):
         x = msg.pose.pose.position.x
@@ -165,7 +202,7 @@ class InspectionNavigator(Node):
 
         # Check if face is within 0.3m of any previously seen face
         for seen_pos in self.seen_faces:
-            if np.linalg.norm(new_pos - np.array(seen_pos)) < 0.3:
+            if np.linalg.norm(new_pos - np.array(seen_pos)) < 0.5:
                 return  # Too close to a previously seen face
 
         # If it's a new one, add to seen
@@ -173,14 +210,13 @@ class InspectionNavigator(Node):
 
         # Convert face into pose
         face_pos = (msg.position.x, msg.position.y)
-        normal = (msg.normal.x, msg.normal.y)
 
         # Prevent excessive closeness duplicates
         for pos, _ in self.face_queue:
-            if math.hypot(pos[0] - face_pos[0], pos[1] - face_pos[1]) < 0.3:
+            if math.hypot(pos[0] - safe_pos[0], pos[1] - safe_pos[1]) < 0.5:
                 return
 
-        self.face_queue.append((face_pos, normal))
+        self.face_queue.append((safe_pos, normal))
         self.get_logger().info(f"👤 Received new face at ({new_pos})")
 
     
@@ -296,7 +332,7 @@ class InspectionNavigator(Node):
         if self.face_queue:
             face = self.face_queue.popleft()
             self.get_logger().info(f"🧠 Navigating to detected face at {face}")
-            self.publish_pushed_face_marker(face[0])
+            self.publish_pushed_face_marker(face[0], normal=face[1])
 
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
@@ -542,7 +578,7 @@ class InspectionNavigator(Node):
 
         return min_dist
 
-    def push_face_from_wall(self, pos, min_dist=0.5, max_push=1.0, step=0.05):
+    def push_face_from_wall(self, pos, min_dist=0.3, max_push=0.5, step=0.05):
         """
         Push the face away from the closest obstacle by checking around it and computing the direction
         from the nearest wall cell to the face.
@@ -573,7 +609,7 @@ class InspectionNavigator(Node):
         if nearest_obs is None:
             return pos  # No obstacle nearby
 
-        # 🧭 Compute push direction
+        # Compute push direction
         obs_world = (
             self.origin.x + nearest_obs[0] * self.resolution,
             self.origin.y + nearest_obs[1] * self.resolution,
@@ -586,9 +622,8 @@ class InspectionNavigator(Node):
         push_dir /= np.linalg.norm(push_dir)
         current_pos = np.array(pos)
 
-        # 🏃 Push outward until we're >= min_dist from wall
+        # Push outward until we're >= min_dist from wall
         while self.distance_to_nearest_wall(current_pos) < min_dist and np.linalg.norm(current_pos - pos) < max_push:
-            self.get_logger().info(f"🟡 Pushing away...")
             current_pos += push_dir * step
 
             # Ensure still in free space

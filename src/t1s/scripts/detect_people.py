@@ -13,6 +13,7 @@ from sensor_msgs_py import point_cloud2 as pc2
 from geometry_msgs.msg import PointStamped, Vector3
 from std_msgs.msg import Header
 from cv_bridge import CvBridge
+from geometry_msgs.msg import Vector3Stamped
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -110,10 +111,30 @@ class FaceDetector(Node):
 
                 transformed = tf2_geometry_msgs.do_transform_point(stamped, transform)
 
+                normal_msg = Vector3Stamped()
+                normal_msg.header.stamp = rclpy.time.Time().to_msg()  # Use latest available
+                normal_msg.header.frame_id = stamped.header.frame_id
+                normal_msg.vector.x = float(normal[0])
+                normal_msg.vector.y = float(normal[1])
+                normal_msg.vector.z = float(normal[2])
+
+                try:
+                    transformed_normal = self.tf_buffer.transform(
+                        normal_msg, 
+                        target_frame="map", 
+                        timeout=rclpy.duration.Duration(seconds=0.5)
+                    )
+
+                    map_normal = np.array([transformed_normal.vector.x, transformed_normal.vector.y, transformed_normal.vector.z])
+                except Exception as e:
+                    self.get_logger().warn(f"Normal transform failed: {e}")
+                    continue
+
                 self.add_to_group(
                     np.array([transformed.point.x, transformed.point.y, transformed.point.z]),
-                    normal
+                    map_normal
                 )
+                
 
             except Exception as e:
                 self.get_logger().warn(f"TF transform failed: {e}")
@@ -154,6 +175,9 @@ class FaceDetector(Node):
 
     def publish_new_faces(self):
         for group in self.face_groups:
+            if len(group['points']) < 5:
+                continue  # Not enough observations for reliable estimate
+
             avg_pos = np.mean(group['points'], axis=0)
             avg_norm = np.mean(group['normals'], axis=0)
             key = tuple(np.round(avg_pos, 2))
@@ -177,9 +201,10 @@ class FaceDetector(Node):
             self.face_pub.publish(msg)
             self.detected_faces_sent.add(key)
 
-            self.get_logger().info(f"🧍 Detected new face at {avg_pos}, normal: {avg_norm}")
-
-
+            self.get_logger().info(
+                f"🧍 Published reliable face (n={len(group['points'])}) at {avg_pos}, normal: {avg_norm}"
+            )
+    
 def main(args=None):
     rclpy.init(args=args)
     node = FaceDetector()
