@@ -65,7 +65,7 @@ class RingDetector(Node):
         self.min_circle_height = 4
         
         # Parameters for 3D validation
-        self.depth_threshold = 0.1  # Expected depth difference for 3D rings (in meters)
+        self.depth_threshold = 0.2  # Expected depth difference for 3D rings (in meters)
         self.ring_depth_samples = 3  # Number of depth samples to check
 
     def image_callback(self, data):
@@ -96,6 +96,13 @@ class RingDetector(Node):
 
             # Convert to HSV color space for better color segmentation
         hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+
+
+        #sky filtering
+        sky_mask = depth_image == np.inf  # Keep only pixels with non-sky depth (tune threshold if needed)
+        masked_color_buffer = hsv_image.copy()
+        masked_color_buffer[sky_mask] = 0
+        hsv_image = masked_color_buffer
         
         # Separate channels
         h, saturation, v = cv2.split(hsv_image)
@@ -338,19 +345,9 @@ class RingDetector(Node):
             self.get_logger().error(f"Error converting depth image: {e}")
             return
 
-        # Process the depth image for visualization
-        depth_viz = depth_image.copy()
-        depth_viz[depth_viz == np.inf] = 0
-        depth_viz[depth_viz > 10] = 10  # Cap maximum distance for visualization
+
         
-        # Normalize for display
-        depth_viz_norm = depth_viz / np.max(depth_viz) if np.max(depth_viz) > 0 else depth_viz
-        depth_viz_display = (depth_viz_norm * 255).astype(np.uint8)
-        
-        # Apply a colormap for better visualization
-        depth_colormap = cv2.applyColorMap(depth_viz_display, cv2.COLORMAP_JET)
-        
-        cv2.imshow("Depth window", depth_colormap)
+        cv2.imshow("Depth window", depth_image)
         cv2.waitKey(1)
 
 def main():
