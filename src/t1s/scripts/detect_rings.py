@@ -129,27 +129,27 @@ class RingDetector(Node):
         
         # # Fit elipses to all extracted contours
         # # After extracting contours but before ellipse fitting
-        # filtered_contours = []
-        # for cnt in contours:
-        #     # Skip contours that are too small
-        #     if len(cnt) < 15:
-        #         continue
+        filtered_contours = []
+        for cnt in contours:
+            # Skip contours that are too small
+            if len(cnt) < 15:
+                continue
             
-        #     # Check if contour is ellipse-like using circularity
-        #     area = cv2.contourArea(cnt)
-        #     perimeter = cv2.arcLength(cnt, True)
-        #     if perimeter <= 0:
-        #         continue
+            # Check if contour is ellipse-like using circularity
+            area = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter <= 0:
+                continue
                 
-        #     circularity = 4 * np.pi * area / (perimeter * perimeter)
-        #     if circularity < 0.6:  # Adjust threshold as needed (0.6-0.8 is good for ellipses)
-        #         continue
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.6:  # Adjust threshold as needed (0.6-0.8 is good for ellipses)
+                continue
             
-        #     # Add to filtered contours
-        #     filtered_contours.append(cnt)
+            # Add to filtered contours
+            filtered_contours.append(cnt)
 
-        # # Use filtered contours instead of all contours
-        # contours = filtered_contours
+        # Use filtered contours instead of all contours
+        contours = filtered_contours
 
         # Draw contours on a copy of the grayscale image
         contour_image = cv2.cvtColor(saturation, cv2.COLOR_GRAY2BGR)
