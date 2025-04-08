@@ -59,13 +59,14 @@ class RingDetector(Node):
         # Parameters for ring detection
         self.min_contour_points = 20
         self.max_center_distance = 5.0
-        self.max_angle_diff = 5.0
+        self.max_angle_diff = 7.0
         self.min_ring_width = 2
-        self.max_ring_width = 20
+        self.max_ring_width = 50
+        self.min_circle_height = 4
         
         # Parameters for 3D validation
         self.depth_threshold = 0.1  # Expected depth difference for 3D rings (in meters)
-        self.ring_depth_samples = 10  # Number of depth samples to check
+        self.ring_depth_samples = 3  # Number of depth samples to check
 
     def image_callback(self, data):
         if self.latest_depth is None:
@@ -97,18 +98,20 @@ class RingDetector(Node):
         hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         
         # Separate channels
-        h, gray, v = cv2.split(hsv_image)
+        h, saturation, v = cv2.split(hsv_image)
         
         # Create a mask of highly saturated areas (likely rings)
         # White/gray rods will have low saturation
         saturation_threshold = 70  # Adjust based on your specific scenario
-        color_mask = cv2.threshold(gray, saturation_threshold, 255, cv2.THRESH_BINARY)[1]
+        # color_mask = cv2.threshold(saturation, saturation_threshold, 255, cv2.THRESH_BINARY)[1]
+        color_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         
         # Method 2: More controlled morphology
         # Skip the dilation and use a small kernel for better precision
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         # Close small gaps in the rings without thickening too much
-        processed_mask = cv2.dilate(color_mask, kernel, iterations=1)
+        processed_mask = cv2.dilate(color_mask, None, iterations=1)
+        processed_mask = cv2.morphologyEx(processed_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         # Find edges of the processed mask
         thresh = cv2.Canny(processed_mask, 50, 150)
 
@@ -122,21 +125,43 @@ class RingDetector(Node):
         cv2.waitKey(1)
 
         
+
+        
+        # # Fit elipses to all extracted contours
+        # # After extracting contours but before ellipse fitting
+        # filtered_contours = []
+        # for cnt in contours:
+        #     # Skip contours that are too small
+        #     if len(cnt) < 15:
+        #         continue
+            
+        #     # Check if contour is ellipse-like using circularity
+        #     area = cv2.contourArea(cnt)
+        #     perimeter = cv2.arcLength(cnt, True)
+        #     if perimeter <= 0:
+        #         continue
+                
+        #     circularity = 4 * np.pi * area / (perimeter * perimeter)
+        #     if circularity < 0.6:  # Adjust threshold as needed (0.6-0.8 is good for ellipses)
+        #         continue
+            
+        #     # Add to filtered contours
+        #     filtered_contours.append(cnt)
+
+        # # Use filtered contours instead of all contours
+        # contours = filtered_contours
+
         # Draw contours on a copy of the grayscale image
-        contour_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(contour_image, contours, -1, (0, 255, 0), 2)
+        contour_image = cv2.cvtColor(saturation, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(contour_image, contours, -1, (0, 255, 0), 1)
         cv2.imshow("Detected contours", contour_image)
         cv2.waitKey(1)
-        
-        # Fit elipses to all extracted contours
+
+        # Fit ellipses to the filtered contours
         ellipses = []
         for cnt in contours:
-            #     print cnt
-            #     print cnt.shape
-            if cnt.shape[0] >= 10:
-                # ((center_x, center_y), (major_axis, minor_axis), angle)
+            if cnt.shape[0] >= 15:
                 ellipse = cv2.fitEllipse(cnt)
-                print(f"\033[94mEllipse: {ellipse}\033[0m")
                 ellipses.append(ellipse)
 
         # Find pairs of concentric ellipses (potential rings)
@@ -146,14 +171,13 @@ class RingDetector(Node):
                 e1 = ellipses[i]
                 e2 = ellipses[j]
                 
-                # # Calculate center distance
+                # Calculate center distance
                 center_dist = np.sqrt(((e1[0][0] - e2[0][0]) ** 2 + (e1[0][1] - e2[0][1]) ** 2))
                 if center_dist > self.max_center_distance:
                     continue
                 
-                # # Check angle difference
-                angle_diff = abs(e1[2] - e2[2]) % 180
-                angle_diff = min(angle_diff, 180 - angle_diff)
+                # Check angle difference
+                angle_diff = np.abs(e1[2] - e2[2])
                 if angle_diff > self.max_angle_diff:
                     continue
                 
@@ -176,10 +200,14 @@ class RingDetector(Node):
                 ring_width = (l_minor - s_minor) / 2
                 if ring_width < self.min_ring_width or ring_width > self.max_ring_width:
                     continue
+
+                if l_minor < self.min_circle_height or s_minor < self.min_circle_height:
+                    continue
                 
-                # # Calculate aspect ratio of the ring
-                aspect_ratio = l_major / l_minor
-                if aspect_ratio > 1.5:  # Reject highly elliptical rings
+                # Calculate aspect ratio of the ring
+                aspect_ratio_l = l_major / l_minor
+                aspect_ratio_s = s_major / s_minor
+                if aspect_ratio_l > 1.5 or aspect_ratio_s > 1.5:  # Reject highly elliptical rings
                     continue
                 border_major = (l_major - s_major) / 2
                 border_minor = (l_minor - s_minor) / 2
@@ -188,12 +216,12 @@ class RingDetector(Node):
                     continue
                 
                 
-                print("\033[91mRing detected\033[0m")  # Red text in terminal
-                ring_candidates.append((larger, smaller))
+                #print("\033[91mRing detected\033[0m")  # Red text in terminal
                 
                 # Check if ring is 3D using depth information
-                # if self.is_3d_ring(depth_image, larger[0], l_major, l_minor, smaller[0], s_major, s_minor):
-                #     print("\033[91mRing detected\033[0m")  # Red text in terminal
+                if self.is_3d_ring(depth_image, larger[0], l_major, l_minor, smaller[0], s_major, s_minor):
+                    print("\033[91mRing detected\033[0m")  # Red text in terminal
+                    ring_candidates.append((larger, smaller))
 
                 # Plot the rings on the image
         for c in ring_candidates:
@@ -254,8 +282,17 @@ class RingDetector(Node):
             x_center = int(cx + r_center * np.cos(angle))
             y_center = int(cy + r_center * np.sin(angle))
             
-            print(f"\033[92mCenter point: ({x_center}, {y_center})\033[0m")
-            print(f"\033[92mDepth image shape: {depth_image.shape}\033[0m")
+            # Create a new visualization image to show sample points
+            if not hasattr(self, 'sample_points_img'):
+                self.sample_points_img = np.zeros((depth_image.shape[0], depth_image.shape[1], 3), dtype=np.uint8)
+            else:
+                # Clear the image for new points
+                self.sample_points_img = np.zeros_like(self.sample_points_img)
+
+            # Draw the center point in red
+            cv2.circle(self.sample_points_img, (x_center, y_center), 3, (0, 0, 255), -1)
+            cv2.imshow("Depth Sample Points", self.sample_points_img)
+            cv2.waitKey(1)
             
             if 0 <= x_center < depth_image.shape[1] and 0 <= y_center < depth_image.shape[0]:
                 depth = depth_image[y_center, x_center]
@@ -276,7 +313,7 @@ class RingDetector(Node):
         print(f"\033[92mRing depths: {ring_depths}\033[0m")
         
         # Check if we have enough valid depth samples
-        if len(center_depths) < 3 or len(ring_depths) < 3:
+        if len(center_depths) < 1 or len(ring_depths) < 1:
             return False
         
         # Calculate median depths to reduce noise impact
@@ -284,7 +321,7 @@ class RingDetector(Node):
         ring_depth = np.median(ring_depths)
         
         # Calculate depth difference
-        depth_diff = abs(center_depth - ring_depth)
+        depth_diff = center_depth - ring_depth
         
         # If the center is significantly farther than the ring, it's likely a 3D ring
         if depth_diff > self.depth_threshold:
