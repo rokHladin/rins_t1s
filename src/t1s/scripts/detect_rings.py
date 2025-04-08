@@ -82,23 +82,42 @@ class RingDetector(Node):
             return
 
         # Tranform image to grayscale
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        # gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
         
         # extract the top half of the image
         # gray = gray[0:int(gray.shape[0]/2),:]
         
         # Threshold the image
         # gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         # thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         #                                cv2.THRESH_BINARY_INV, 15, 9)
+
+            # Convert to HSV color space for better color segmentation
+        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        
+        # Separate channels
+        h, gray, v = cv2.split(hsv_image)
+        
+        # Create a mask of highly saturated areas (likely rings)
+        # White/gray rods will have low saturation
+        saturation_threshold = 70  # Adjust based on your specific scenario
+        color_mask = cv2.threshold(gray, saturation_threshold, 255, cv2.THRESH_BINARY)[1]
         
         # open + close
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
-        thresh = cv2.morphologyEx(thresh.copy(), cv2.MORPH_OPEN, kernel, iterations=1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
+        # thresh = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        thresh = cv2.dilate(color_mask.copy(), None, iterations=1)
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
+        # thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))a
+        # thresh = cv2.morphologyEx(thresh.copy(), cv2.MORPH_OPEN, kernel, iterations=1)
         
+
+        # Show the color-based mask
+        cv2.imshow("Color Mask", color_mask)
+        cv2.waitKey(1)
+
         # cv2.imshow("Binary Image", thresh)
         # cv2.waitKey(1)
 
