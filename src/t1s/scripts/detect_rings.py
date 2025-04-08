@@ -58,10 +58,10 @@ class RingDetector(Node):
         
         # Parameters for ring detection
         self.min_contour_points = 20
-        self.max_center_distance = 7.0
-        self.max_angle_diff = 6.0
+        self.max_center_distance = 5.0
+        self.max_angle_diff = 5.0
         self.min_ring_width = 2
-        self.max_ring_width = 30
+        self.max_ring_width = 20
         
         # Parameters for 3D validation
         self.depth_threshold = 0.1  # Expected depth difference for 3D rings (in meters)
@@ -104,39 +104,18 @@ class RingDetector(Node):
         saturation_threshold = 70  # Adjust based on your specific scenario
         color_mask = cv2.threshold(gray, saturation_threshold, 255, cv2.THRESH_BINARY)[1]
         
-        # open + close
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
-        # thresh = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-        thresh = cv2.dilate(color_mask.copy(), None, iterations=1)
-        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
-        # thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))a
-        # thresh = cv2.morphologyEx(thresh.copy(), cv2.MORPH_OPEN, kernel, iterations=1)
-        
+        # Method 2: More controlled morphology
+        # Skip the dilation and use a small kernel for better precision
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Close small gaps in the rings without thickening too much
+        processed_mask = cv2.dilate(color_mask, kernel, iterations=1)
+        # Find edges of the processed mask
+        thresh = cv2.Canny(processed_mask, 50, 150)
 
-        # Show the color-based mask
-        cv2.imshow("Color Mask", color_mask)
-        cv2.waitKey(1)
-
-        # cv2.imshow("Binary Image", thresh)
-        # cv2.waitKey(1)
-
-        # Extract contours
+        # Extract contours - use the edge image for thinner contours
         contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    
-        ring_contours = []
-        for contour in contours:
-            # Calculate circularity = 4*pi*area/perimeter^2
-            area = cv2.contourArea(contour)
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter > 0:
-                circularity = 4 * np.pi * area / (perimeter * perimeter)
-                # Rings should have high circularity (closer to 1)
-                if circularity > 0.5:  # Adjust threshold based on your rings
-                    ring_contours.append(contour)
-    
-        contours = ring_contours
+
         
         # Show binary image
         cv2.imshow("Binary Image", thresh)
