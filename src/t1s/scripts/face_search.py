@@ -66,6 +66,9 @@ class InspectionNavigator(Node):
             self.amcl_callback,
             10
         )
+        
+        self.odom_pose = None
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, qos_profile_sensor_data)
 
         self.occupancy = None
         self.resolution = None
@@ -95,6 +98,19 @@ class InspectionNavigator(Node):
 
         #self.init_timer = self.create_timer(2.0, self.set_initial_pose_once)
         self.pose_sent = False
+
+    def odom_callback(self, msg: Odometry):
+        if self.pose_sent or self.robot_pose is not None:
+            return
+
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        yaw = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
+
+        self.get_logger().info("📍 Using odometry to initialize AMCL pose")
+        self.publish_initial_pose(x, y, math.degrees(yaw))
+        self.pose_sent = True
 
 
     def set_initial_pose_once(self):
@@ -300,6 +316,9 @@ class InspectionNavigator(Node):
     def loop(self):
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
+            
+        #x, y, ryaw = self.robot_pose
+        #self.get_logger().info(f"🔔 YAW {math.degrees(ryaw)}")
 
         # 🟡 Handle interrupt goal execution
         if self.interrupting:
