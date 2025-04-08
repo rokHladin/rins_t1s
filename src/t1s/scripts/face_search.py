@@ -20,6 +20,9 @@ import cv2
 from robot_commander import RobotCommander
 from t1s.msg import DetectedFace
 
+from geometry_msgs.msg import PoseWithCovarianceStamped
+
+
 
 
 class InspectionNavigator(Node):
@@ -34,9 +37,13 @@ class InspectionNavigator(Node):
 
         self.sub_map = self.create_subscription(OccupancyGrid, '/map', self.map_callback, qos)
         self.sub_markers = self.create_subscription(MarkerArray, '/inspection_markers', self.markers_callback, qos)
-        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
 
         self.pub_visited = self.create_publisher(MarkerArray, '/visited_inspection_markers', 10)
+
+        self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self.pushed_face_pub = self.create_publisher(Marker, '/pushed_faces', 10)
+
+
 
         self.create_subscription(
             DetectedFace,
@@ -51,6 +58,13 @@ class InspectionNavigator(Node):
             '/ring_position',
             self.ring_callback,
             qos_profile_sensor_data
+        )
+
+        self.sub_amcl = self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/amcl_pose',
+            self.amcl_callback,
+            10
         )
 
         self.occupancy = None
@@ -79,9 +93,75 @@ class InspectionNavigator(Node):
         self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
         self.latest_image = None
 
+        #self.init_timer = self.create_timer(2.0, self.set_initial_pose_once)
+        self.pose_sent = False
+
+
+    def set_initial_pose_once(self):
+        if not self.pose_sent and self.robot_pose is None:
+            self.publish_initial_pose(x=0.0, y=0.0, yaw_deg=0)
+            self.pose_sent = True
+            self.get_logger().info("📍 Published initial pose")
+
+
+    def publish_initial_pose(self, x, y, yaw_deg):
+        yaw_rad = math.radians(yaw_deg)
+        q = transforms3d.euler.euler2quat(0, 0, yaw_rad, axes='sxyz')
+
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.x = q[1]
+        msg.pose.pose.orientation.y = q[2]
+        msg.pose.pose.orientation.z = q[3]
+        msg.pose.pose.orientation.w = q[0]
+
+        # Optional: Set small covariance to indicate high confidence
+        msg.pose.covariance[0] = 0.1  # x
+        msg.pose.covariance[7] = 0.1  # y
+        msg.pose.covariance[35] = math.radians(5)**2  # yaw (in rad^2)
+
+        self.initial_pose_pub.publish(msg)
+        self.get_logger().info("📍 Published initial pose to AMCL")
+
+    def publish_pushed_face_marker(self, position):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "pushed_faces"
+        m.id = int(position[0] * 1000) + int(position[1] * 1000)  # Unique-ish ID
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = position[0]
+        m.pose.position.y = position[1]
+        m.pose.position.z = 0.0
+        m.scale.x = 0.15
+        m.scale.y = 0.15
+        m.scale.z = 0.05
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        self.pushed_face_pub.publish(m)
+
+
+    def amcl_callback(self, msg):
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        yaw = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
+        self.robot_pose = (x, y, yaw)
 
     def face_callback(self, msg: DetectedFace):
         new_pos = np.array([msg.position.x, msg.position.y])
+        normal = (msg.normal.x, msg.normal.y)
+
+        # Push position if too close to wall
+        safe_pos = self.push_face_from_wall(new_pos)
+
 
         # Check if face is within 0.3m of any previously seen face
         for seen_pos in self.seen_faces:
@@ -122,14 +202,18 @@ class InspectionNavigator(Node):
             self.get_logger().error(f"❌ Error converting image: {e}")
 
 
-
     def map_callback(self, msg):
         self.resolution = msg.info.resolution
         self.origin = msg.info.origin.position
+
+        # Convert occupancy grid to numpy array
         grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.occupancy = np.ones_like(grid)
-        self.occupancy[grid == 100] = 0
-        self.occupancy[grid == -1] = -1
+
+        # Classify grid values
+        self.occupancy[grid == 100] = 0    # Wall/obstacle
+        self.occupancy[grid == 0] = 1      # Free space
+        self.occupancy[grid == -1] = -1    # Unknown
 
     def markers_callback(self, msg):
         self.get_logger().info("📦 Received markers")
@@ -174,13 +258,6 @@ class InspectionNavigator(Node):
         self.cam_poses = list(cam_map.values())
         self.get_logger().info(f"🟦 Loaded {len(self.cam_poses)} camera poses")
 
-    def odom_callback(self, msg):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        yaw = self.quaternion_to_yaw(q)
-        self.robot_pose = (x, y, yaw)
-
     def quaternion_to_yaw(self, q):
         return transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
 
@@ -219,6 +296,8 @@ class InspectionNavigator(Node):
         if self.face_queue:
             face = self.face_queue.popleft()
             self.get_logger().info(f"🧠 Navigating to detected face at {face}")
+            self.publish_pushed_face_marker(face[0])
+
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
             self.interrupting = True
@@ -282,7 +361,6 @@ class InspectionNavigator(Node):
             return False
 
         rx, ry, ryaw = robot_pose
-        #ryaw = ryaw + math.pi/4
         tx, ty = target
         nx, ny = normal
 
@@ -338,13 +416,9 @@ class InspectionNavigator(Node):
                     #skip = True
                     return False
 
-        #self.get_logger().info(f"Cam yaw (std) = {math.degrees(ryaw):.1f}°, Robot pos = ({rx:.1f}, {ry:.1f}), view_angle = {math.degrees(view_angle):.1f}")
         #self.get_logger().info(f"Target pos = ({tx:.1f}, {ty:.1f}), FOV angle = {math.degrees(angle_to_heading):.1f}°, Facing angle = {math.degrees(angle):.1f}°, LOS = {los}")
 
         return True #not skip
-
-
-
 
     def bresenham(self, x0, y0, x1, y1):
         dx = abs(x1 - x0)
@@ -446,6 +520,86 @@ class InspectionNavigator(Node):
 
     def heuristic(self, a, b):
         return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    def distance_to_nearest_wall(self, pos, search_radius=0.5):
+        """
+        Estimates distance from position to the nearest obstacle in the occupancy grid.
+        """
+        gx = int((pos[0] - self.origin.x) / self.resolution)
+        gy = int((pos[1] - self.origin.y) / self.resolution)
+        radius_px = int(search_radius / self.resolution)
+
+        min_dist = float('inf')
+        for dx in range(-radius_px, radius_px + 1):
+            for dy in range(-radius_px, radius_px + 1):
+                x = gx + dx
+                y = gy + dy
+                if 0 <= x < self.occupancy.shape[1] and 0 <= y < self.occupancy.shape[0]:
+                    if self.occupancy[y, x] != 1:
+                        dist = math.hypot(dx, dy) * self.resolution
+                        if dist < min_dist:
+                            min_dist = dist
+
+        return min_dist
+
+    def push_face_from_wall(self, pos, min_dist=0.5, max_push=1.0, step=0.05):
+        """
+        Push the face away from the closest obstacle by checking around it and computing the direction
+        from the nearest wall cell to the face.
+        """
+        if self.occupancy is None or self.resolution is None or self.origin is None:
+            return pos  # Fallback if map is not available
+
+        gx = int((pos[0] - self.origin.x) / self.resolution)
+        gy = int((pos[1] - self.origin.y) / self.resolution)
+        radius_px = int(max_push / self.resolution)
+
+        height, width = self.occupancy.shape
+        nearest_obs = None
+        min_d2 = float('inf')
+
+        # 🔍 Find nearest obstacle in the surrounding area
+        for dx in range(-radius_px, radius_px + 1):
+            for dy in range(-radius_px, radius_px + 1):
+                x = gx + dx
+                y = gy + dy
+                if 0 <= x < width and 0 <= y < height:
+                    if self.occupancy[y, x] != 1:
+                        d2 = dx**2 + dy**2
+                        if d2 < min_d2:
+                            min_d2 = d2
+                            nearest_obs = (x, y)
+
+        if nearest_obs is None:
+            return pos  # No obstacle nearby
+
+        # 🧭 Compute push direction
+        obs_world = (
+            self.origin.x + nearest_obs[0] * self.resolution,
+            self.origin.y + nearest_obs[1] * self.resolution,
+        )
+
+        push_dir = np.array(pos) - np.array(obs_world)
+        if np.linalg.norm(push_dir) == 0:
+            return pos  # Cannot compute direction
+
+        push_dir /= np.linalg.norm(push_dir)
+        current_pos = np.array(pos)
+
+        # 🏃 Push outward until we're >= min_dist from wall
+        while self.distance_to_nearest_wall(current_pos) < min_dist and np.linalg.norm(current_pos - pos) < max_push:
+            self.get_logger().info(f"🟡 Pushing away...")
+            current_pos += push_dir * step
+
+            # Ensure still in free space
+            gx = int((current_pos[0] - self.origin.x) / self.resolution)
+            gy = int((current_pos[1] - self.origin.y) / self.resolution)
+            if not (0 <= gx < width and 0 <= gy < height) or self.occupancy[gy, gx] != 1:
+                return pos  # Invalid or blocked
+
+        return tuple(current_pos)
+
+
 
 
 def main(args=None):
