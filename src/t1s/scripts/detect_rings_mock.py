@@ -88,6 +88,7 @@ class RingDetector(Node):
             self.get_logger().info(f"🔔 Published ring at {avg_pos} with color '{color}'")
 
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = RingDetector()
