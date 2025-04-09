@@ -17,6 +17,10 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 
 from t1s.msg import DetectedRing
 import matplotlib.pyplot as plt
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
+from rclpy.qos import qos_profile_sensor_data
+
 
 
 qos_profile = QoSProfile(
@@ -56,6 +60,15 @@ class RingDetector(Node):
 
         # Store the latest depth image
         self.latest_depth = None
+        
+        self.latest_pointcloud = None
+        self.pc_sub = self.create_subscription(
+            PointCloud2,
+            "/oakd/rgb/preview/depth/points",
+            self.pc_callback,
+            qos_profile_sensor_data
+        )
+
         
         # Subscribe to the image and/or depth topic
         self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
@@ -377,18 +390,57 @@ class RingDetector(Node):
             else:
                 return
 
-            if (color != None):
-                #got ring color
-                print(f"color: {color}   prob: {p:.3}   depth: {median_depth:.3} m")
-                center1 = e1[0]
-                center2 = e2[0]
-                
-                cx = (center1[0] + center2[0]) // 2
-                cy = (center1[1] + center2[1]) // 2
-                
-                map_point = np.array([cx, cy, 0.0])
-                self.add_ring_to_group(map_point, color)
-                
+            if color is not None:
+                if self.latest_pointcloud is None:
+                    self.get_logger().warn("No point cloud received yet, skipping 3D conversion.")
+                    return
+
+                try:
+                    # Read point cloud as numpy array (H, W, 3)
+                    pc_array = pc2.read_points_numpy(
+                        self.latest_pointcloud, field_names=("x", "y", "z")
+                    ).reshape((self.latest_pointcloud.height, self.latest_pointcloud.width, 3))
+
+                    # Get (u, v) indices where mask_ring is 255
+                    ys, xs = np.where(mask_ring == 255)
+
+                    # Extract 3D points from the point cloud at those indices
+                    points_3d = pc_array[ys, xs]  # shape: (N, 3)
+
+                    # Filter out NaN or zero-length vectors
+                    valid_points = points_3d[
+                        np.isfinite(points_3d).all(axis=1) & (np.linalg.norm(points_3d, axis=1) > 0.05)
+                    ]
+
+                    if valid_points.shape[0] < 3:
+                        self.get_logger().warn("Not enough valid 3D points for averaging.")
+                        return
+
+                    avg_3d = np.mean(valid_points, axis=0)
+
+                    # Transform to map frame
+                    stamped = PointStamped()
+                    stamped.header.stamp = self.get_clock().now().to_msg()
+                    stamped.header.frame_id = self.latest_pointcloud.header.frame_id
+                    stamped.point.x = float(avg_3d[0])
+                    stamped.point.y = float(avg_3d[1])
+                    stamped.point.z = float(avg_3d[2])
+
+                    transform = self.tf_buffer.lookup_transform(
+                        target_frame="map",
+                        source_frame=stamped.header.frame_id,
+                        time=rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.5)
+                    )
+                    transformed = tf2_geometry_msgs.do_transform_point(stamped, transform)
+
+                    map_point = np.array([transformed.point.x, transformed.point.y, transformed.point.z])
+
+                    #self.get_logger().warn(f"RING AT {map_point}")
+                    self.add_ring_to_group(map_point, color)
+
+                except Exception as e:
+                    self.get_logger().warn(f"Failed to get averaged 3D point for ring: {e}")
 
             # drawing the ellipses on the image
             cv2.ellipse(cv_image, bigger_ellipse, (0, 255, 0), 2)
@@ -508,6 +560,17 @@ class RingDetector(Node):
         cv2.imshow("Depth window", depth_image)
         cv2.waitKey(1)
 
+    def deproject_pixel_to_point(self, u, v, depth, fx, fy, cx, cy):
+        """Convert pixel (u,v) + depth to 3D point in camera coordinates."""
+        X = (u - cx) * depth / fx
+        Y = (v - cy) * depth / fy
+        Z = depth
+        return np.array([X, Y, Z])
+
+    def pc_callback(self, msg):
+        self.latest_pointcloud = msg
+
+
     def add_ring_to_group(self, position, color, threshold=0.5):
         for group in self.ring_groups:
             if np.linalg.norm(group['position'] - position) < threshold:
@@ -518,7 +581,6 @@ class RingDetector(Node):
 
     def publish_new_rings(self):
         for group in self.ring_groups:
-            #self.get_logger().info(f"🔔 Published ring at with color")
             if len(group['positions']) < 3:
                 continue
 
@@ -534,31 +596,21 @@ class RingDetector(Node):
             majority_color = max(color_counts, key=color_counts.get)
 
             try:
-                stamped = PointStamped()
-                stamped.header.stamp = self.get_clock().now().to_msg()
-                stamped.header.frame_id = "oakd_rgb_camera_frame"  # Adjust to your actual camera frame
-                stamped.point.x = float(avg_pos[0])
-                stamped.point.y = float(avg_pos[1])
-                stamped.point.z = float(avg_pos[2])
-
-                transform = self.tf_buffer.lookup_transform(
-                    target_frame="map",
-                    source_frame=stamped.header.frame_id,
-                    time=rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=0.5)
-                )
-                transformed = tf2_geometry_msgs.do_transform_point(stamped, transform)
-
                 msg = DetectedRing()
-                msg.position = transformed
+                msg.position.header.stamp = self.get_clock().now().to_msg()
+                msg.position.header.frame_id = "map"  # ✅ Position is already in map frame
+                msg.position.point.x = float(avg_pos[0])
+                msg.position.point.y = float(avg_pos[1])
+                msg.position.point.z = float(avg_pos[2])
                 msg.color = majority_color
 
                 self.detected_ring_pub.publish(msg)
                 self.detected_rings_sent.add(key)
-                self.get_logger().info(f"🔔 Published ring at with color {majority_color}")
+                self.get_logger().info(f"🔔 Published ring at {avg_pos.round(2)} with color {majority_color}")
 
             except Exception as e:
-                self.get_logger().warn(f"TF transform failed for ring: {e}")
+                self.get_logger().warn(f"Failed to publish ring: {e}")
+
 
 def main():
     rclpy.init(args=None)

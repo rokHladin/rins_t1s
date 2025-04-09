@@ -82,7 +82,12 @@ class FaceDetector(Node):
                 continue
 
             normal, centroid = self.fit_plane(points)
-            if normal is None:
+            if normal is None or not np.all(np.isfinite(centroid)) or not np.all(np.isfinite(normal)):
+                self.get_logger().warn("Plane fitting failed or returned invalid values.")
+                continue
+
+            if np.linalg.norm(normal) < 1e-3:
+                self.get_logger().warn("Normal vector too small, skipping.")
                 continue
 
             # Flip normal to face the camera
@@ -92,6 +97,9 @@ class FaceDetector(Node):
                 normal = -normal
 
             offset = centroid + normal * 0.5
+            if not np.all(np.isfinite(offset)):
+                self.get_logger().warn("Offset point contains NaNs or infs, skipping.")
+                continue
 
             try:
                 # Properly create PointStamped
@@ -105,66 +113,81 @@ class FaceDetector(Node):
                 transform = self.tf_buffer.lookup_transform(
                     target_frame="map",
                     source_frame=msg.header.frame_id,
-                    time=rclpy.time.Time(),  # latest available
+                    time=rclpy.time.Time(),
                     timeout=rclpy.duration.Duration(seconds=0.5)
                 )
 
                 transformed = tf2_geometry_msgs.do_transform_point(stamped, transform)
 
+                # Prepare and validate the normal
                 normal_msg = Vector3Stamped()
-                normal_msg.header.stamp = rclpy.time.Time().to_msg()  # Use latest available
+                normal_msg.header.stamp = rclpy.time.Time().to_msg()
                 normal_msg.header.frame_id = stamped.header.frame_id
                 normal_msg.vector.x = float(normal[0])
                 normal_msg.vector.y = float(normal[1])
                 normal_msg.vector.z = float(normal[2])
 
-                try:
-                    transformed_normal = self.tf_buffer.transform(
-                        normal_msg, 
-                        target_frame="map", 
-                        timeout=rclpy.duration.Duration(seconds=0.5)
-                    )
+                transformed_normal = self.tf_buffer.transform(
+                    normal_msg,
+                    target_frame="map",
+                    timeout=rclpy.duration.Duration(seconds=0.5)
+                )
 
-                    map_normal = np.array([transformed_normal.vector.x, transformed_normal.vector.y, transformed_normal.vector.z])
-                except Exception as e:
-                    self.get_logger().warn(f"Normal transform failed: {e}")
+                map_normal = np.array([
+                    transformed_normal.vector.x,
+                    transformed_normal.vector.y,
+                    transformed_normal.vector.z
+                ])
+
+                if not np.all(np.isfinite(map_normal)):
+                    self.get_logger().warn("Transformed normal contains NaNs.")
                     continue
 
                 self.add_to_group(
                     np.array([transformed.point.x, transformed.point.y, transformed.point.z]),
                     map_normal
                 )
-                
 
             except Exception as e:
                 self.get_logger().warn(f"TF transform failed: {e}")
+
 
     def fit_plane(self, points, threshold=0.015, max_iters=100):
         best_inliers = []
         best_normal = None
 
         for _ in range(max_iters):
-            sample = points[random.sample(range(len(points)), 3)]
-            v1 = sample[1] - sample[0]
-            v2 = sample[2] - sample[0]
-            normal = np.cross(v1, v2)
-            if np.linalg.norm(normal) == 0:
+            try:
+                sample = points[random.sample(range(len(points)), 3)]
+                v1 = sample[1] - sample[0]
+                v2 = sample[2] - sample[0]
+                normal = np.cross(v1, v2)
+
+                if not np.all(np.isfinite(normal)) or np.linalg.norm(normal) < 1e-3:
+                    continue
+
+                normal = normal / np.linalg.norm(normal)
+
+                distances = np.abs(np.dot(points - sample[0], normal))
+                inliers = points[distances < threshold]
+
+                if len(inliers) > len(best_inliers):
+                    best_inliers = inliers
+                    best_normal = normal
+
+            except Exception as e:
+                self.get_logger().warn(f"Plane fitting iteration failed: {e}")
                 continue
-            normal = normal / np.linalg.norm(normal)
-
-            distances = np.abs(np.dot(points - sample[0], normal))
-            inliers = points[distances < threshold]
-
-            if len(inliers) > len(best_inliers):
-                best_inliers = inliers
-                best_normal = normal
 
         if best_normal is not None and len(best_inliers) > 0:
             centroid = np.mean(best_inliers, axis=0)
+            if not np.all(np.isfinite(centroid)):
+                return None, None
             return best_normal, centroid
 
         return None, None
 
+    
     def add_to_group(self, new_point, normal, threshold=0.5):
         for group in self.face_groups:
             if np.linalg.norm(group['point'] - new_point) < threshold:
@@ -174,8 +197,9 @@ class FaceDetector(Node):
         self.face_groups.append({'points': [new_point], 'normals': [normal], 'point': new_point})
 
     def publish_new_faces(self):
-        for group in self.face_groups:
-            if len(group['points']) < 5:
+        for i, group in enumerate(self.face_groups):
+            if len(group['points']) < 3:
+                self.get_logger().warn(f"too little measurements. {i}")
                 continue  # Not enough observations for reliable estimate
 
             avg_pos = np.mean(group['points'], axis=0)
@@ -183,6 +207,7 @@ class FaceDetector(Node):
             key = tuple(np.round(avg_pos, 2))
 
             if key in self.detected_faces_sent:
+                self.get_logger().warn("Face already sent. {i}")
                 continue
 
             msg = DetectedFace()

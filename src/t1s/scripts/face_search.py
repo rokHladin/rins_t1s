@@ -101,6 +101,12 @@ class InspectionNavigator(Node):
         #self.init_timer = self.create_timer(2.0, self.set_initial_pose_once)
         self.pose_sent = False
 
+        self.amcl_pose_received = False
+        self.retry_attempts = 0
+        self.max_retries = 5
+        self.retry_timer = self.create_timer(2.0, self.check_amcl_pose_timeout)
+
+
     def odom_callback(self, msg: Odometry):
         if self.pose_sent or self.robot_pose is not None:
             return
@@ -109,6 +115,8 @@ class InspectionNavigator(Node):
         y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
         yaw = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
+
+        self.odom_pose = (x, y, yaw)
 
         self.get_logger().info("📍 Using odometry to initialize AMCL pose")
         self.publish_initial_pose(x, y, math.degrees(yaw))
@@ -145,83 +153,6 @@ class InspectionNavigator(Node):
         self.initial_pose_pub.publish(msg)
         self.get_logger().info("📍 Published initial pose to AMCL")
 
-    def publish_ring_marker(self, position):
-        marker = Marker()
-        marker.header.frame_id = "map"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "rings"
-        marker.id = int(position[0] * 1000) + int(position[1] * 1000)
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = position[0]
-        marker.pose.position.y = position[1]
-        marker.pose.position.z = 0.0
-        marker.scale.x = 0.15
-        marker.scale.y = 0.15
-        marker.scale.z = 0.05
-        marker.color.r = 1.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
-        marker.color.a = 1.0
-        self.pub_ring_marker.publish(MarkerArray(markers=[marker]))
-
-
-    def publish_pushed_face_marker(self, position, normal=None):
-        # Red dot for the face position
-        m = Marker()
-        m.header.frame_id = "map"
-        m.header.stamp = self.get_clock().now().to_msg()
-        m.ns = "pushed_faces"
-        m.id = int(position[0] * 1000) + int(position[1] * 1000)
-        m.type = Marker.SPHERE
-        m.action = Marker.ADD
-        m.pose.position.x = position[0]
-        m.pose.position.y = position[1]
-        m.pose.position.z = 0.0
-        m.scale.x = 0.15
-        m.scale.y = 0.15
-        m.scale.z = 0.05
-        m.color.r = 1.0
-        m.color.g = 0.0
-        m.color.b = 0.0
-        m.color.a = 1.0
-        self.pushed_face_pub.publish(m)
-
-        # Optional arrow for the normal vector
-        if normal is not None:
-            arrow = Marker()
-            arrow.header.frame_id = "map"
-            arrow.header.stamp = self.get_clock().now().to_msg()
-            arrow.ns = "pushed_faces"
-            arrow.id = m.id + 1000000
-            arrow.type = Marker.ARROW
-            arrow.action = Marker.ADD
-            arrow.scale.x = 0.05  # shaft diameter
-            arrow.scale.y = 0.1   # head diameter
-            arrow.scale.z = 0.1   # head length
-            arrow.color.r = 0.0
-            arrow.color.g = 1.0
-            arrow.color.b = 0.0
-            arrow.color.a = 1.0
-
-            start = position
-            end = (
-                position[0] + normal[0] * 0.5,
-                position[1] + normal[1] * 0.5,
-                0.0
-            )
-            arrow.points.append(self.make_point(start))
-            arrow.points.append(self.make_point(end))
-
-            self.pushed_face_pub.publish(arrow)
-
-    def make_point(self, pos):
-        pt = PointStamped().point
-        pt.x = pos[0]
-        pt.y = pos[1]
-        pt.z = pos[2] if len(pos) > 2 else 0.0
-        return pt
-
     
 
     def amcl_callback(self, msg):
@@ -230,6 +161,20 @@ class InspectionNavigator(Node):
         q = msg.pose.pose.orientation
         yaw = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
         self.robot_pose = (x, y, yaw)
+        self.amcl_pose_received = True
+
+    def check_amcl_pose_timeout(self):
+        if self.pose_sent and not self.amcl_pose_received:
+            if self.retry_attempts < self.max_retries:
+                self.retry_attempts += 1
+                self.get_logger().warn(f"🕒 AMCL pose not received yet. Retrying initial pose... (attempt {self.retry_attempts})")
+                # Re-publish odometry-derived pose
+                if self.odom_pose:
+                    x, y, yaw = self.odom_pose
+                    self.publish_initial_pose(x, y, math.degrees(yaw))
+            else:
+                self.get_logger().error("❌ Max retries reached. AMCL is not responding to initial pose.")
+
 
     def face_callback(self, msg: DetectedFace):
         new_pos = np.array([msg.position.x, msg.position.y])
@@ -254,6 +199,10 @@ class InspectionNavigator(Node):
         for pos, _ in self.face_queue:
             if math.hypot(pos[0] - safe_pos[0], pos[1] - safe_pos[1]) < 0.5:
                 return
+
+        if not np.all(np.isfinite(new_pos)) or not np.all(np.isfinite(normal)):
+            self.get_logger().warn("Discarded invalid face with NaNs.")
+            return
 
         self.face_queue.append((safe_pos, normal))
         self.get_logger().info(f"👤 Received new face at ({new_pos})")
@@ -350,6 +299,7 @@ class InspectionNavigator(Node):
         return transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
 
     def loop(self):
+        self.get_logger().info(f"task complete {self.cmdr.isTaskComplete()}, interrupting {self.interrupting}, waiting for completion {self.waiting_for_interrupt_completion}")
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
             
@@ -377,7 +327,7 @@ class InspectionNavigator(Node):
                         self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
                     return
 
-                # Wait until the navigation actually starts
+                # After the movement starts this return is skipped
                 if self.waiting_for_interrupt_completion:
                     if not self.cmdr.isTaskComplete():
                         self.waiting_for_interrupt_completion = False
@@ -386,7 +336,7 @@ class InspectionNavigator(Node):
                 # Do not check isTaskComplete() for ring goal, let distance control it
                 return
 
-            # Default interrupt behavior (e.g., face goal)
+            # After the movement starts this return is skipped
             if self.waiting_for_interrupt_completion:
                 if not self.cmdr.isTaskComplete():
                     self.waiting_for_interrupt_completion = False
@@ -399,6 +349,7 @@ class InspectionNavigator(Node):
                 self.waiting_for_interrupt_completion = False
 
                 if self.resume_after_interrupt:
+                    self.get_logger().info("resumming...")
                     self.active_goal = self.resume_after_interrupt
                     self.resume_after_interrupt = None
                     self.cmdr.goToPose(self.active_goal['pose'])
@@ -414,6 +365,7 @@ class InspectionNavigator(Node):
             self.get_logger().info(f"🧠 Navigating to detected face at {face}")
             self.publish_pushed_face_marker(face[0], normal=face[1])
 
+            # goal to pick up after
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
             self.interrupting = True
@@ -603,6 +555,85 @@ class InspectionNavigator(Node):
         ma.markers.append(m)
 
         self.pub_visited.publish(ma)
+
+    def publish_ring_marker(self, position):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "rings"
+        marker.id = int(position[0] * 1000) + int(position[1] * 1000)
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = position[0]
+        marker.pose.position.y = position[1]
+        marker.pose.position.z = 0.0
+        marker.scale.x = 0.15
+        marker.scale.y = 0.15
+        marker.scale.z = 0.05
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        self.pub_ring_marker.publish(MarkerArray(markers=[marker]))
+
+
+    def publish_pushed_face_marker(self, position, normal=None):
+        # Red dot for the face position
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "pushed_faces"
+        m.id = int(position[0] * 1000) + int(position[1] * 1000)
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = position[0]
+        m.pose.position.y = position[1]
+        m.pose.position.z = 0.0
+        m.scale.x = 0.15
+        m.scale.y = 0.15
+        m.scale.z = 0.05
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        self.pushed_face_pub.publish(m)
+
+        # Optional arrow for the normal vector
+        if normal is not None:
+            arrow = Marker()
+            arrow.header.frame_id = "map"
+            arrow.header.stamp = self.get_clock().now().to_msg()
+            arrow.ns = "pushed_faces"
+            arrow.id = m.id + 1000000
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.scale.x = 0.05  # shaft diameter
+            arrow.scale.y = 0.1   # head diameter
+            arrow.scale.z = 0.1   # head length
+            arrow.color.r = 0.0
+            arrow.color.g = 1.0
+            arrow.color.b = 0.0
+            arrow.color.a = 1.0
+
+            start = position
+            end = (
+                position[0] + normal[0] * 0.5,
+                position[1] + normal[1] * 0.5,
+                0.0
+            )
+            arrow.points.append(self.make_point(start))
+            arrow.points.append(self.make_point(end))
+
+            self.pushed_face_pub.publish(arrow)
+
+    def make_point(self, pos):
+        pt = PointStamped().point
+        pt.x = pos[0]
+        pt.y = pos[1]
+        pt.z = pos[2] if len(pos) > 2 else 0.0
+        return pt
+
+
 
     def astar_path_length(self, p1, p2):
         if self.occupancy is None or self.resolution is None:
