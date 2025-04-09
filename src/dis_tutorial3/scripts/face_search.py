@@ -421,9 +421,9 @@ class InspectionNavigator(Node):
         if self.active_goal:
 
             #FIX THIS SHIT
-            if self.active_goal.get('is_hardcoded', False):
+            if self.active_goal.get('hardcoded', False):
                 if self.cmdr.isTaskComplete():
-                    self.get_logger().info("✅ Arrived at hardcoded goal.")
+                    self.get_logger().info("🐢🐢🐢 Arrived at hardcoded goal.")
                     self.publish_visited_markers(self.active_goal)
                     self.active_goal = None
                 return
