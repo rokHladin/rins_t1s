@@ -158,6 +158,40 @@ class Planner(Node):
         markers = MarkerArray()
         cam_marker_id = 0
 
+        ring_goals = [
+            {'pose': (2.41, -1.24, math.radians(90)), 'label': 'green'},
+            {'pose': (0.89, 1.47, math.radians(-90)), 'label': 'blue'},
+            {'pose': (1.93, 1.96, math.radians(180)), 'label': 'red'},
+            {'pose': (-0.38, -1.72, math.radians(90)), 'label': 'black'},
+        ]
+
+        for ring in ring_goals:
+            x, y, yaw = ring['pose']
+            q = transforms3d.euler.euler2quat(0, 0, yaw, axes='sxyz')
+            q = (q[1], q[2], q[3], q[0])
+
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.ns = "inspection"
+            marker.id = 10_000 + cam_marker_id  # Offset to avoid collision
+            cam_marker_id += 1
+            marker.type = Marker.ARROW
+            marker.action = Marker.ADD
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+            marker.scale.x = 0.5
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            marker.color.r = 0.0
+            marker.color.g = 0.0
+            marker.color.b = 1.0
+            marker.color.a = 1.0
+            markers.markers.append(marker)
+
+
+
+
         for entry in cam_targets:
             x, y, yaw = entry['pose']
             q = transforms3d.euler.euler2quat(0, 0, yaw, axes='sxyz')

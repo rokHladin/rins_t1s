@@ -73,6 +73,8 @@ class FaceDetector(Node):
             return
 
         for cx, cy in self.faces:
+            self.get_logger().warn(f"Face found at ({cx},{cy})")
+
             window = 10
             region = pc_array[max(0, cy - window):cy + window, max(0, cx - window):cx + window, :]
             points = region.reshape(-1, 3)
@@ -198,7 +200,7 @@ class FaceDetector(Node):
 
     def publish_new_faces(self):
         for i, group in enumerate(self.face_groups):
-            if len(group['points']) < 3:
+            if len(group['points']) < 5:
                 self.get_logger().warn(f"too little measurements. {i}")
                 continue  # Not enough observations for reliable estimate
 
@@ -207,7 +209,6 @@ class FaceDetector(Node):
             key = tuple(np.round(avg_pos, 2))
 
             if key in self.detected_faces_sent:
-                self.get_logger().warn("Face already sent. {i}")
                 continue
 
             msg = DetectedFace()

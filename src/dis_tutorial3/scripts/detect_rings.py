@@ -106,16 +106,15 @@ class RingDetector(Node):
         self.ring_depth_samples = 10    #number of depth points to check
 
         #color recognition
-        self.black_threshold = 0.45
+        self.black_threshold = 0.35
         self.pure_color_hsv_histograms = {
             "red": generate_hsv_color_hist((0, 0, 255)),
             "green": generate_hsv_color_hist((0, 255, 0)),
-            "blue": generate_hsv_color_hist((255, 0, 0)),
-            "yellow" : generate_hsv_color_hist((0, 255, 255))
+            "blue": generate_hsv_color_hist((255, 0, 0))
+            #"yellow" : generate_hsv_color_hist((0, 255, 255))
         }
 
         
-
 
     def label_image(self, img, label_text):
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -538,7 +537,7 @@ class RingDetector(Node):
         self.latest_pointcloud = msg
 
 
-    def add_ring_to_group(self, position, color, threshold=0.5):
+    def add_ring_to_group(self, position, color, threshold = 0.5):
         for group in self.ring_groups:
             if np.linalg.norm(group['position'] - position) < threshold:
                 group['positions'].append(position)

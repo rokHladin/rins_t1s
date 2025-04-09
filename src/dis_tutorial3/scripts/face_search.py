@@ -23,7 +23,8 @@ from dis_tutorial3.msg import DetectedRing
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
 
-
+import pyttsx3
+from pyttsx3.engine import Engine
 
 
 class InspectionNavigator(Node):
@@ -105,6 +106,9 @@ class InspectionNavigator(Node):
         self.retry_attempts = 0
         self.max_retries = 5
         self.retry_timer = self.create_timer(2.0, self.check_amcl_pose_timeout)
+
+        self.sr = pyttsx3.init()
+        self.active_ring_color = None
 
 
     def odom_callback(self, msg: Odometry):
@@ -264,7 +268,8 @@ class InspectionNavigator(Node):
                     'pose': (m.pose.position.x, m.pose.position.y, yaw),
                     'targets': [],
                     'seen': set(),
-                    'marker_id': m.id
+                    'marker_id': m.id,
+                    'hardcoded': m.id >= 10_000 
                 }
 
         green_count = 0
@@ -298,6 +303,14 @@ class InspectionNavigator(Node):
     def quaternion_to_yaw(self, q):
         return transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])[2]
 
+    def speak(self, engine: Engine, text):
+        engine.setProperty('rate', 150)  # Speed of speech
+        engine.setProperty('volume', 0.6)  # Volume level (0.0 to 1.0)
+        engine.say(text)
+        engine.runAndWait()
+
+
+
     def loop(self):
         self.get_logger().info(f"task complete {self.cmdr.isTaskComplete()}, interrupting {self.interrupting}, waiting for completion {self.waiting_for_interrupt_completion}")
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
@@ -321,29 +334,22 @@ class InspectionNavigator(Node):
                     self.waiting_for_interrupt_completion = False
                     self.active_ring_goal = None
 
+                    #say ring color
+                    self.speak(self.sr, f"This is a {self.active_ring_color} ring")
+
                     if self.resume_after_interrupt:
                         self.active_goal = self.resume_after_interrupt
                         self.resume_after_interrupt = None
                         self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
                     return
-
-                # After the movement starts this return is skipped
-                if self.waiting_for_interrupt_completion:
-                    if not self.cmdr.isTaskComplete():
-                        self.waiting_for_interrupt_completion = False
-                    return
-
                 # Do not check isTaskComplete() for ring goal, let distance control it
-                return
-
-            # After the movement starts this return is skipped
-            if self.waiting_for_interrupt_completion:
-                if not self.cmdr.isTaskComplete():
-                    self.waiting_for_interrupt_completion = False
                 return
 
             if self.cmdr.isTaskComplete():
                 self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
+
+                #greet persons
+                self.speak(self.sr, f"Hello Persons")
 
                 self.interrupting = False
                 self.waiting_for_interrupt_completion = False
@@ -375,6 +381,13 @@ class InspectionNavigator(Node):
             x, y = face[0]
             yaw = math.atan2(-face[1][1], -face[1][0])
             self.cmdr.goToPose((x, y, yaw))
+            
+            if self.cmdr.isTaskComplete():
+                self.get_logger().warn("⚠️ Face goal was not accepted or instantly marked complete. Skipping.")
+                self.interrupting = False
+                self.waiting_for_interrupt_completion = False
+                return
+
             return
 
         elif self.ring_queue:
@@ -386,6 +399,7 @@ class InspectionNavigator(Node):
             self.interrupting = True
             self.waiting_for_interrupt_completion = True
             self.active_ring_goal = ring
+            self.active_ring_color = color
 
             # WHAT TO DO ON RING DETECTION
             rx, ry, _ = self.robot_pose
@@ -393,10 +407,28 @@ class InspectionNavigator(Node):
             yaw = math.atan2(ty - ry, tx - rx)
             self.cmdr.goToPose((tx, ty, yaw))
 
+            # New addition
+            if self.cmdr.isTaskComplete():
+                self.get_logger().warn(":warning: Ring goal was not accepted or instantly marked complete. Skipping.")
+                self.interrupting = False
+                self.waiting_for_interrupt_completion = False
+                self.active_ring_goal = None
+                return
+
             return
 
         # 📸 Main inspection loop
         if self.active_goal:
+
+            #FIX THIS SHIT
+            if self.active_goal.get('is_hardcoded', False):
+                if self.cmdr.isTaskComplete():
+                    self.get_logger().info("✅ Arrived at hardcoded goal.")
+                    self.publish_visited_markers(self.active_goal)
+                    self.active_goal = None
+                return
+            
+
             any_seen = False
             for i, (tx, ty, nx, ny, marker_id) in enumerate(self.active_goal['targets']):
                 if i in self.active_goal['seen']:
