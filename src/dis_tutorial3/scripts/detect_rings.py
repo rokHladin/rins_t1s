@@ -308,7 +308,7 @@ class RingDetector(Node):
         #fit ellipsis to contours
         ellipses = []
         for cnt in contours:
-            if cnt.shape[0] >= 5:
+            if cnt.shape[0] >= 10:  # Fit ellipse only if there are enough points
                 ellipse = cv2.fitEllipse(cnt)
                 ellipses.append(ellipse)
 
