@@ -43,6 +43,8 @@ class FaceDetector(Node):
 
         self.timer = self.create_timer(1.0, self.publish_new_faces)
 
+        self.face_depth_check = 2.0
+
         self.get_logger().info("✅ detect_people running. Waiting for faces...")
 
     def rgb_callback(self, msg):
@@ -74,6 +76,11 @@ class FaceDetector(Node):
 
         for cx, cy in self.faces:
             self.get_logger().warn(f"Face found at ({cx},{cy})")
+
+            pc_check_depth = pc_array[cy, cx, :]
+            if np.isnan(pc_check_depth).any() or np.linalg.norm(pc_check_depth) > self.face_depth_check:
+                self.get_logger().warn("Face is too far or invalid depth.")
+                continue
 
             window = 10
             region = pc_array[max(0, cy - window):cy + window, max(0, cx - window):cx + window, :]

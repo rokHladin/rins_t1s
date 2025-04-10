@@ -104,6 +104,7 @@ class RingDetector(Node):
         #depth validation params
         self.depth_threshold = 1.5      #min dist between ring center and ring
         self.ring_depth_samples = 10    #number of depth points to check
+        self.ring_depth_check = 3.0
 
         #color recognition
         self.black_threshold = 0.35
@@ -394,6 +395,10 @@ class RingDetector(Node):
             if valid_depths.size > 0:
                 median_depth = np.median(valid_depths)
             else:
+                return
+            
+            if np.isnan(median_depth) or median_depth > self.ring_depth_check:
+                self.get_logger().warn("Ring is too far or invalid depth.")
                 return
 
             #output the final ring

@@ -31,6 +31,7 @@ install(DIRECTORY
   config
   worlds
   maps
+  rviz
   DESTINATION share/${PROJECT_NAME}/
 )
 
