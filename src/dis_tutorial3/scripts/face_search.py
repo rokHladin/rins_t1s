@@ -88,7 +88,6 @@ class InspectionNavigator(Node):
         self.active_ring_goal = None
 
         self.interrupting = False
-        self.waiting_for_interrupt_completion = False
         self.resume_after_interrupt = None
 
 
@@ -312,122 +311,114 @@ class InspectionNavigator(Node):
 
 
     def loop(self):
-        self.get_logger().info(f"task complete {self.cmdr.isTaskComplete()}, interrupting {self.interrupting}, waiting for completion {self.waiting_for_interrupt_completion}")
+        self.get_logger().info(f"task complete {self.cmdr.isTaskComplete()}, interrupting {self.interrupting}, goals left: {len(self.cam_poses)}")
         if self.robot_pose is None or self.occupancy is None or not self.cam_poses:
             return
-            
-        #x, y, ryaw = self.robot_pose
-        #self.get_logger().info(f"🔔 YAW {math.degrees(ryaw)}")
 
-        # Handle interrupt goal execution
+        now = self.get_clock().now()
+        
+        # === INTERRUPT HANDLING ===
         if self.interrupting:
-            # Handle ring goal separately
+            # --- RING GOAL ---
             if self.active_ring_goal:
                 rx, ry, _ = self.robot_pose
                 tx, ty = self.active_ring_goal
                 dist = math.hypot(tx - rx, ty - ry)
 
-                if dist < 1.0:
-                    self.get_logger().info("✅ Reached ring (within 1m). Canceling goal and resuming inspection.")
+                timeout_elapsed = (
+                    hasattr(self, "interrupt_start_time") and 
+                    (now - self.interrupt_start_time).nanoseconds > 20 * 1e9  # 20 seconds
+                )
+
+                if dist < 1.0 or self.cmdr.isTaskComplete() or timeout_elapsed:
+                    self.get_logger().info("✅ Reached or finished ring. Canceling goal and resuming inspection.")
                     self.cmdr.cancelTask()
                     self.interrupting = False
-                    self.waiting_for_interrupt_completion = False
                     self.active_ring_goal = None
 
-                    #say ring color
-                    self.speak(self.sr, f"This is a {self.active_ring_color} ring")
+                    # Say ring color
+                    if hasattr(self, "active_ring_color"):
+                        self.speak(self.sr, f"This is a {self.active_ring_color} ring")
 
                     if self.resume_after_interrupt:
                         self.active_goal = self.resume_after_interrupt
                         self.resume_after_interrupt = None
-                        self.cmdr.goToPose(self.active_goal['pose'])  # resume previous inspection goal
+                        self.cmdr.goToPose(self.active_goal['pose'])
                     return
-                # Do not check isTaskComplete() for ring goal, let distance control it
+
                 return
 
+            # --- FACE GOAL COMPLETION ---
             if self.cmdr.isTaskComplete():
                 self.get_logger().info("✅ Finished interrupt target. Resuming inspection...")
 
-                #greet persons
                 self.speak(self.sr, f"Hello Persons")
 
                 self.interrupting = False
-                self.waiting_for_interrupt_completion = False
+                self.active_ring_goal = None
+                self.interrupt_start_time = None
 
                 if self.resume_after_interrupt:
-                    self.get_logger().info("resumming...")
+                    self.get_logger().info("Resuming...")
                     self.active_goal = self.resume_after_interrupt
                     self.resume_after_interrupt = None
                     self.cmdr.goToPose(self.active_goal['pose'])
                 else:
-                    self.get_logger().info("🕵️ No resume goal, waiting for next inspection target.")
+                    self.get_logger().info("🕵️ No resume goal.")
             return
 
-
-        
-        # 🔁 Check for interruptions
+        # === INTERRUPTIONS FROM QUEUES ===
         if self.face_queue:
             face = self.face_queue.popleft()
             self.get_logger().info(f"🧠 Navigating to detected face at {face}")
             self.publish_pushed_face_marker(face[0], normal=face[1])
 
-            # goal to pick up after
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
             self.interrupting = True
-            self.waiting_for_interrupt_completion = True
+            self.interrupt_start_time = now
 
-            # WHAT TO DO ON FACE DETECTION
             x, y = face[0]
             yaw = math.atan2(-face[1][1], -face[1][0])
             self.cmdr.goToPose((x, y, yaw))
-            
-            if self.cmdr.isTaskComplete():
-                self.get_logger().warn("⚠️ Face goal was not accepted or instantly marked complete. Skipping.")
-                self.interrupting = False
-                self.waiting_for_interrupt_completion = False
-                return
 
+            if self.cmdr.isTaskComplete():
+                self.get_logger().warn("⚠️ Face goal was not accepted or already completed.")
+                self.interrupting = False
             return
 
         elif self.ring_queue:
             ring, color = self.ring_queue.popleft()
             self.get_logger().info(f"🟡 Navigating to ring at {ring} (color: {color})")
             self.publish_ring_marker(ring)
+
             self.resume_after_interrupt = self.active_goal
             self.active_goal = None
             self.interrupting = True
-            self.waiting_for_interrupt_completion = True
+            self.interrupt_start_time = now
             self.active_ring_goal = ring
             self.active_ring_color = color
 
-            # WHAT TO DO ON RING DETECTION
             rx, ry, _ = self.robot_pose
             tx, ty = ring
             yaw = math.atan2(ty - ry, tx - rx)
             self.cmdr.goToPose((tx, ty, yaw))
 
-            # New addition
             if self.cmdr.isTaskComplete():
-                self.get_logger().warn(":warning: Ring goal was not accepted or instantly marked complete. Skipping.")
+                self.get_logger().warn("⚠️ Ring goal not accepted or completed instantly.")
                 self.interrupting = False
-                self.waiting_for_interrupt_completion = False
                 self.active_ring_goal = None
-                return
-
             return
 
-        # 📸 Main inspection loop
+        # === INSPECTION GOALS ===
         if self.active_goal:
-
-            #FIX THIS SHIT
+            # Hardcoded goal? Skip target checking
             if self.active_goal.get('hardcoded', False):
                 if self.cmdr.isTaskComplete():
                     self.get_logger().info("🐢🐢🐢 Arrived at hardcoded goal.")
                     self.publish_visited_markers(self.active_goal)
                     self.active_goal = None
                 return
-            
 
             any_seen = False
             for i, (tx, ty, nx, ny, marker_id) in enumerate(self.active_goal['targets']):
@@ -438,7 +429,7 @@ class InspectionNavigator(Node):
                     any_seen = True
 
             if any_seen:
-                self.get_logger().info("👀 Some green targets seen. Deleting from RViz...")
+                self.get_logger().info("👀 Some green targets seen. Removing markers...")
 
             if len(self.active_goal['seen']) == len(self.active_goal['targets']):
                 self.get_logger().info("✅ All targets seen. Canceling move.")
@@ -454,6 +445,7 @@ class InspectionNavigator(Node):
                 self.publish_visited_markers(self.active_goal)
                 self.active_goal = None
 
+        # === GET NEXT GOAL ===
         if self.cam_poses:
             next_goal = min(self.cam_poses, key=lambda c: self.astar_path_length(self.robot_pose, c['pose']))
             self.cam_poses.remove(next_goal)
@@ -462,6 +454,7 @@ class InspectionNavigator(Node):
             self.active_goal = next_goal
             self.get_logger().info(f"➡️ Going to next pose at {next_goal['pose']}")
             self.cmdr.goToPose(next_goal['pose'])
+
 
 
     def is_visible(self, robot_pose, target, normal, fov_deg=90, min_angle_deg=45):

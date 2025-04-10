@@ -40,8 +40,6 @@ install(PROGRAMS
   scripts/planner.py
   scripts/face_search.py
   scripts/detect_rings.py
-  scripts/planner_mock.py
-  scripts/detect_rings_mock.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
