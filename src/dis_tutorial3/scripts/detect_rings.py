@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from rclpy.qos import qos_profile_sensor_data
-
+from scipy.ndimage import gaussian_filter1d
 
 
 qos_profile = QoSProfile(
@@ -33,17 +33,20 @@ qos_profile = QoSProfile(
 
 
 
-def generate_hsv_color_hist(bgr_color, image_size=(100, 100), std_dev=7):
-    color_patch = np.full((image_size[1], image_size[0], 3), bgr_color, dtype=np.uint8)
-    hsv_patch = cv2.cvtColor(color_patch, cv2.COLOR_BGR2HSV)
-    hue_value = int(hsv_patch[0, 0, 0])
+def generate_wrapped_gaussian(center, std_dev = 8, normalize=True):
     bins = np.arange(180)
-    gaussian_hist = np.exp(-0.5 * ((bins - hue_value) / std_dev) ** 2)
-    gaussian_hist = gaussian_hist.astype(np.float32)
-    gaussian_hist = cv2.normalize(gaussian_hist, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-    gaussian_hist = gaussian_hist.reshape(-1, 1)
-    return gaussian_hist
+    gaussian = np.exp(-0.5 * ((bins - center) / std_dev) ** 2)
 
+    if center < std_dev:
+        gaussian += np.exp(-0.5 * ((bins - (180 + center)) / std_dev) ** 2)
+    elif center > 180 - std_dev:
+        gaussian += np.exp(-0.5 * ((bins - (center - 180)) / std_dev) ** 2)
+
+    gaussian = gaussian.astype(np.float32)
+    if normalize:
+        gaussian = gaussian / np.sum(gaussian)
+
+    return gaussian.reshape(-1, 1)
 
 class RingDetector(Node):
     def __init__(self):
@@ -104,18 +107,16 @@ class RingDetector(Node):
         #depth validation params
         self.depth_threshold = 1.5      #min dist between ring center and ring
         self.ring_depth_samples = 10    #number of depth points to check
-        self.ring_depth_check = 3.0
+        self.ring_depth_check = 2.0
 
         #color recognition
         self.black_threshold = 0.35
         self.pure_color_hsv_histograms = {
-            "red": generate_hsv_color_hist((0, 0, 255)),
-            "green": generate_hsv_color_hist((0, 255, 0)),
-            "blue": generate_hsv_color_hist((255, 0, 0))
-            #"yellow" : generate_hsv_color_hist((0, 255, 255))
+            "red": generate_wrapped_gaussian(center=0),
+            "green": generate_wrapped_gaussian(center=60),
+            "blue": generate_wrapped_gaussian(center=120)
         }
 
-        
 
     def label_image(self, img, label_text):
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -163,54 +164,62 @@ class RingDetector(Node):
         cv2.imshow(window_name, grid)
         cv2.waitKey(1)
 
+    def smooth_histogram_circular(self, hist, sigma=2):
+        hist_1d = hist.flatten()
+        padded = np.concatenate([hist_1d[-10:], hist_1d, hist_1d[:10]])
+        smoothed = gaussian_filter1d(padded, sigma=sigma)
+        smoothed = smoothed[10:-10]
+        return smoothed.reshape(-1, 1)
 
     def get_ring_color(self, mask_ring, color_buffer_hsv):
         if cv2.countNonZero(mask_ring) == 0:
             self.get_logger().warn("Empty ring mask, skipping color detection.")
             return None, 0.0
-
+    
         # Visualize masked region
         #bgr_image = cv2.cvtColor(color_buffer_hsv, cv2.COLOR_HSV2BGR)
         #bgr_image_masked = cv2.bitwise_and(bgr_image, bgr_image, mask=mask_ring)
         #black_pixels = np.all(bgr_image_masked == [0, 0, 0], axis=-1)
         #bgr_image_masked[black_pixels] = [255, 255, 255]
         #cv2.imshow("Ring Region (white background)", bgr_image_masked)
-        #cv2.waitKey(1)
+        #cv2.waitKey(5)
 
-        #black is the edge case because it does not depend on HUE
+        # Check if it's black (based on brightness)
         v_channel = color_buffer_hsv[:, :, 2]
         ring_v_values = v_channel[mask_ring == 255]
         intensity = np.mean(ring_v_values)
-
-        s_channel = color_buffer_hsv[:, :, 1]
-        ring_s_values = s_channel[mask_ring == 255]
-        saturation = np.mean(ring_s_values)
-
-        #color strongly suggests black
         intensity_val = intensity / 255
-        #print(intensity_val)
-        if (intensity_val < self.black_threshold):
+        if intensity_val < self.black_threshold:
             return "black", (self.black_threshold - intensity_val) / self.black_threshold
 
-        
-        # Histogram of masked pixels
-        hue_hist = cv2.calcHist([color_buffer_hsv], [0], mask_ring, [180], [0, 180])
-        hue_hist = hue_hist.astype(np.float32)
-        hue_hist = cv2.normalize(hue_hist, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+        #create histogram
+        hue_hist = cv2.calcHist([color_buffer_hsv], [0], mask_ring, [180], [0, 180]).astype(np.float32)
+        hue_hist = self.smooth_histogram_circular(hue_hist, sigma=3)
+        hue_hist = hue_hist / np.sum(hue_hist)
         hue_hist = hue_hist.reshape(-1, 1)
 
-        # Plot histogram
-        #plt.plot(hue_hist)
-        #plt.title("Hue Histogram for Ring")
-        #plt.xlabel("Hue")
-        #plt.ylabel("Normalized Frequency")
-        #plt.show()
+        # # Plot hue histogram
+        # plt.plot(hue_hist)
+        # plt.title("Hue Histogram for Ring")
+        # plt.xlabel("Hue")
+        # plt.ylabel("Normalized Frequency (L1)")
+        # plt.grid(True)
+        # plt.tight_layout()
+        # plt.show()
 
-        # Classify by comparing with reference histograms
         scores = {}
+        def cosine_similarity(a, b):
+            norm_a = np.linalg.norm(a)
+            norm_b = np.linalg.norm(b)
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return float(np.dot(a.T, b) / (norm_a * norm_b))
+
+        # Replace INTERSECT with cosine
         for color_name, ref_hist in self.pure_color_hsv_histograms.items():
-            score = cv2.compareHist(hue_hist, ref_hist, cv2.HISTCMP_INTERSECT)
-            scores[color_name] = score
+            score = cosine_similarity(hue_hist, ref_hist)
+            scores[color_name] = max(0.0, score)
+            #print(f"Score for {color_name}: {score:.4f}")
 
         total = sum(scores.values())
         if total == 0:
@@ -220,24 +229,22 @@ class RingDetector(Node):
         probabilities = {color: score / total for color, score in scores.items()}
         top_color = max(probabilities, key=probabilities.get)
 
-        # Plot probability bar chart
-        #labels = list(probabilities.keys())
-        #values = list(probabilities.values())
-        #plt.figure(figsize=(8, 4))
-        #bars = plt.bar(labels, values, color=labels)
-        #plt.title("Color probabilities")
-        #plt.ylabel("Probability")
-        #plt.ylim(0, 1.0)
-        #for bar, value in zip(bars, values):
-        #    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-        #        f"{value:.2f}", ha='center', va='bottom')
-        #plt.grid(axis='y', linestyle='--', alpha=0.5)
-        #plt.tight_layout()
-        #plt.show()
+        # Plot classification result
+        # labels = list(probabilities.keys())
+        # values = list(probabilities.values())
+        # plt.figure(figsize=(8, 4))
+        # bars = plt.bar(labels, values, color=labels)
+        # plt.title("Color Probabilities")
+        # plt.ylabel("Probability")
+        # plt.ylim(0, 1.0)
+        # for bar, value in zip(bars, values):
+        #     plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+        #             f"{value:.2f}", ha='center', va='bottom')
+        # plt.grid(axis='y', linestyle='--', alpha=0.5)
+        # plt.tight_layout()
+        # plt.show()
 
         return top_color, probabilities[top_color]
-
-
 
 
     def image_callback(self, data):

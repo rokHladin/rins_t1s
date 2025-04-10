@@ -43,7 +43,9 @@ class FaceDetector(Node):
 
         self.timer = self.create_timer(1.0, self.publish_new_faces)
 
-        self.face_depth_check = 2.0
+        self.face_confidence_threshold = 0.6
+        self.face_depth_check = 1.5
+        self.number_of_detections_threshold = 5
 
         self.get_logger().info("✅ detect_people running. Waiting for faces...")
 
@@ -52,7 +54,7 @@ class FaceDetector(Node):
 
         try:
             img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            results = self.model.predict(img, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
+            results = self.model.predict(img, imgsz=(256, 320), conf = self.face_confidence_threshold, show=False, verbose=False, classes=[0], device=self.device)
 
             for r in results:
                 for bbox in r.boxes.xyxy.cpu().numpy():
@@ -62,7 +64,8 @@ class FaceDetector(Node):
                     self.faces.append((cx, cy))
 
         except Exception as e:
-            self.get_logger().error(f"Image processing failed: {str(e)}")
+            self.get_logger().warn(f"Failed to process image: {e}")
+
 
     def pc_callback(self, msg):
         if not self.faces:
@@ -207,8 +210,8 @@ class FaceDetector(Node):
 
     def publish_new_faces(self):
         for i, group in enumerate(self.face_groups):
-            if len(group['points']) < 5:
-                self.get_logger().warn(f"too little measurements. {i}")
+            if len(group['points']) < self.number_of_detections_threshold:
+                #self.get_logger().warn(f"too little measurements. {i}")
                 continue  # Not enough observations for reliable estimate
 
             avg_pos = np.mean(group['points'], axis=0)

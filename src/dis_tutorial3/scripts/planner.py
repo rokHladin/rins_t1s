@@ -32,7 +32,7 @@ class Planner(Node):
 
         # Marker generation settings
         self.cam_offset = 0.5
-        self.target_offset = 0.1
+        self.target_offset = 0.2
         self.spacing = 0.3
         self.max_line_length_m = 2.0
         self.min_clearance_m = 0.3
@@ -48,7 +48,7 @@ class Planner(Node):
         height = msg.info.height
 
         # Load and flip PGM map (origin is at bottom left)
-        package_path = get_package_share_directory('t1s')
+        package_path = get_package_share_directory('dis_tutorial3')
         map_path = os.path.join(package_path, 'maps', 'map.pgm')
         img = cv2.imread(map_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
@@ -160,11 +160,15 @@ class Planner(Node):
 
         ring_goals = [
             {'pose': (2.41, -1.24, math.radians(90)), 'label': 'green'},
+            {'pose' : (0.39, -1.91, math.radians(0)), 'label' : 'green'},
             {'pose': (0.89, 1.47, math.radians(-90)), 'label': 'blue'},
             {'pose': (1.93, 1.96, math.radians(180)), 'label': 'red'},
+            {'pose': (0.04, -0.48, math.radians(180)), 'label': 'red'},
             {'pose': (-0.38, -1.72, math.radians(90)), 'label': 'black'},
+            {'pose': (-0.94, 0.40, math.radians(95)), 'label': 'black'},
+            {'pose': (-1.67, 3.98, math.radians(-90)), 'label': 'black'}
         ]
-
+        
         for ring in ring_goals:
             x, y, yaw = ring['pose']
             q = transforms3d.euler.euler2quat(0, 0, yaw, axes='sxyz')

@@ -109,6 +109,8 @@ class InspectionNavigator(Node):
         self.sr = pyttsx3.init()
         self.active_ring_color = None
 
+        self.ring_visit_dist = 0.6
+
 
     def odom_callback(self, msg: Odometry):
         if self.pose_sent or self.robot_pose is not None:
@@ -330,7 +332,7 @@ class InspectionNavigator(Node):
                     (now - self.interrupt_start_time).nanoseconds > 20 * 1e9  # 20 seconds
                 )
 
-                if dist < 1.0 or self.cmdr.isTaskComplete() or timeout_elapsed:
+                if dist < self.ring_visit_dist or self.cmdr.isTaskComplete() or timeout_elapsed:
                     self.get_logger().info("✅ Reached or finished ring. Canceling goal and resuming inspection.")
                     self.cmdr.cancelTask()
                     self.interrupting = False
