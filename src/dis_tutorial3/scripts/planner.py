@@ -160,13 +160,13 @@ class Planner(Node):
 
         ring_goals = [
             {'pose': (2.41, -1.24, math.radians(90)), 'label': 'green'},
-            {'pose' : (0.39, -1.91, math.radians(0)), 'label' : 'green'},
+            {'pose' : (0.79, -1.91, math.radians(0)), 'label' : 'green'},
             {'pose': (0.89, 1.47, math.radians(-90)), 'label': 'blue'},
             {'pose': (1.93, 1.96, math.radians(180)), 'label': 'red'},
             {'pose': (0.04, -0.48, math.radians(180)), 'label': 'red'},
             {'pose': (-0.38, -1.72, math.radians(90)), 'label': 'black'},
             {'pose': (-0.94, 0.40, math.radians(95)), 'label': 'black'},
-            {'pose': (-1.67, 3.98, math.radians(-90)), 'label': 'black'}
+            {'pose': (-1.67, 3.78, math.radians(-90)), 'label': 'black'}
         ]
         
         for ring in ring_goals:
