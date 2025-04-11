@@ -170,6 +170,12 @@ class RingDetector(Node):
         smoothed = gaussian_filter1d(padded, sigma=sigma)
         smoothed = smoothed[10:-10]
         return smoothed.reshape(-1, 1)
+    
+    def normalize_depth_for_display(self, depth, max_display_depth=2.0):
+        depth_vis = np.nan_to_num(depth.copy(), nan=0.0, posinf=0.0)
+        depth_vis = np.clip(depth_vis, 0.0, max_display_depth)
+        depth_vis = (depth_vis / max_display_depth * 255).astype(np.uint8)
+        return depth_vis
 
     def get_ring_color(self, mask_ring, color_buffer_hsv):
         if cv2.countNonZero(mask_ring) == 0:
@@ -260,7 +266,7 @@ class RingDetector(Node):
         except CvBridgeError as e:
             self.get_logger().error(f"Error converting images: {e}")
             return
-        
+                
         #save color image to use for visualization
         if self.draw_visualization_windows:
             vw_color_image = cv_image.copy()
@@ -315,7 +321,7 @@ class RingDetector(Node):
         #fit ellipsis to contours
         ellipses = []
         for cnt in contours:
-            if cnt.shape[0] >= 10:  # Fit ellipse only if there are enough points
+            if cnt.shape[0] >= 9:  # Fit ellipse only if there are enough points
                 ellipse = cv2.fitEllipse(cnt)
                 ellipses.append(ellipse)
 
@@ -374,7 +380,7 @@ class RingDetector(Node):
         #copy for elipse visualization
         if self.draw_visualization_windows:
             vw_draw_ellipsis = vw_color_image.copy()
-
+        
         #final processing for the ring candidates
         for c in ring_candidates:
             bigger_ellipse = c[0]
@@ -471,7 +477,7 @@ class RingDetector(Node):
         if self.draw_visualization_windows:
             image_dict = {
                 "Color Image" : vw_color_image,
-                "Depth Image" : depth_image, 
+                "Depth Image" : self.normalize_depth_for_display(depth_image), 
                 "Canny Edges" : canny_edges,
                 "Contours" : vw_contours,
                 "Detected Rings" : vw_draw_ellipsis

@@ -95,8 +95,8 @@ class InspectionNavigator(Node):
         self.timer = self.create_timer(1.0, self.loop)
 
         self.bridge = CvBridge()
-        self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
-        self.latest_image = None
+        # self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
+        # self.latest_image = None
 
         #self.init_timer = self.create_timer(2.0, self.set_initial_pose_once)
         self.pose_sent = False
@@ -233,15 +233,15 @@ class InspectionNavigator(Node):
         self.get_logger().info(f"🔔 Ring detected at {new_pos} with color '{color}'")
 
 
-    def image_callback(self, msg):
-        try:
-            self.latest_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            cv2.imshow("Camera View", self.latest_image)
-            key = cv2.waitKey(1)
-            if key == 27:  # ESC to quit
-                rclpy.shutdown()
-        except Exception as e:
-            self.get_logger().error(f"❌ Error converting image: {e}")
+    # def image_callback(self, msg):
+    #     try:
+    #         # self.latest_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+    #         # cv2.imshow("Camera View", self.latest_image)
+    #         key = cv2.waitKey(1)
+    #         if key == 27:  # ESC to quit
+    #             rclpy.shutdown()
+    #     except Exception as e:
+    #         self.get_logger().error(f"❌ Error converting image: {e}")
 
 
     def map_callback(self, msg):
