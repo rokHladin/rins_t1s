@@ -52,6 +52,8 @@ class RingDetector(Node):
     def __init__(self):
         super().__init__('ring_detector')
 
+        print("Initializing...")
+
         # Basic ROS stuff
         timer_frequency = 2
         timer_period = 1/timer_frequency
@@ -73,11 +75,13 @@ class RingDetector(Node):
             self.pc_callback,
             qos_profile_sensor_data
         )
-
+        print("pc subscription created")
         
         # Subscribe to the image and/or depth topic
-        self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
-        self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
+        self.image_sub = self.create_subscription(Image, "/oak/rgb/image_raw", self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, "/oak/stereo/image_raw", self.depth_callback, 1)
+
+        print("image subscriptions created")
         
         # Publisher for ring detections
         self.ring_pub = self.create_publisher(Marker, "/detected_ring", 10)
@@ -271,9 +275,14 @@ class RingDetector(Node):
         if self.draw_visualization_windows:
             vw_color_image = cv_image.copy()
 
+        cv_image_filtered = cv2.GaussianBlur(cv_image, (7, 7), 0)
+
         #convert image to HSV and extract saturation channel
-        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        hsv_image = cv2.cvtColor(cv_image_filtered, cv2.COLOR_BGR2HSV)
         _, saturation, _ = cv2.split(hsv_image)
+
+        cv2.imshow("Depth image", depth_image)
+        cv2.waitKey(1)
 
         #filter out sky from saturation image
         sky_mask = depth_image == np.inf
@@ -283,11 +292,17 @@ class RingDetector(Node):
         
         #mask of highly saturated areas (rings)
         color_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        cv2.imshow("Binary Image", color_mask)
+        cv2.waitKey(1)
         
         #preprocess the mask with morphology operations
         SE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         processed_mask = cv2.dilate(color_mask, None, iterations=1)
-        processed_mask = cv2.morphologyEx(processed_mask, cv2.MORPH_CLOSE, SE, iterations=2)
+        processed_mask = cv2.morphologyEx(processed_mask, cv2.MORPH_CLOSE, SE, iterations=1)
+
+        cv2.imshow("Processed mask", processed_mask)
+        cv2.waitKey(1)
 
         #run canny edge detection and extract contours
         canny_edges = cv2.Canny(processed_mask, 50, 150)
@@ -373,9 +388,11 @@ class RingDetector(Node):
                 if border_diff > 5:
                     continue
                 
+
+                ring_candidates.append((larger, smaller))
                 #validate ring with depth information
-                if self.is_3d_ring(depth_image, larger[0], l_major, l_minor, smaller[0], s_major, s_minor):
-                    ring_candidates.append((larger, smaller))
+                # if self.is_3d_ring(depth_image, larger[0], l_major, l_minor, smaller[0], s_major, s_minor):
+                #     ring_candidates.append((larger, smaller))
 
         #copy for elipse visualization
         if self.draw_visualization_windows:
@@ -410,9 +427,9 @@ class RingDetector(Node):
             else:
                 return
             
-            if np.isnan(median_depth) or median_depth > self.ring_depth_check:
-                self.get_logger().warn("Ring is too far or invalid depth.")
-                return
+            # if np.isnan(median_depth) or median_depth > self.ring_depth_check:
+            #     self.get_logger().warn("Ring is too far or invalid depth.")
+            #     return
 
             #output the final ring
             if color is not None:

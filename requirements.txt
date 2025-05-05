@@ -18,7 +18,6 @@ ament-uncrustify==0.12.12
 ament-xmllint==0.12.12
 angles==1.15.0
 appdirs==1.4.4
-apturl==0.5.2
 argcomplete==1.8.1
 asttokens==3.0.0
 attrs==25.3.0
@@ -29,13 +28,11 @@ beniget==0.4.1
 bleach==6.2.0
 blinker==1.4
 bond==4.1.2
-Brlapi==0.8.3
 Brotli==1.0.9
 builtin-interfaces==1.2.1
 catkin-pkg-modules==1.0.0
 certifi==2020.6.20
 chardet==4.0.0
-chrome-gnome-shell==0.0.0
 click==8.0.3
 colcon-argcomplete==0.3.3
 colcon-bash==0.5.0
@@ -78,7 +75,6 @@ cycler==0.11.0
 dbus-python==1.2.18
 debugpy==1.8.13
 decorator==4.4.2
-defer==1.0.6
 defusedxml==0.7.1
 demo-nodes-py==0.20.5
 diagnostic-msgs==4.8.0
@@ -147,7 +143,6 @@ lazr.restfulclient==0.14.4
 lazr.uri==1.0.6
 lifecycle-msgs==1.2.1
 logging-demo==0.20.5
-louis==3.20.0
 lxml==4.8.0
 lz4==3.1.3+dfsg
 macaroonbakery==1.3.1
